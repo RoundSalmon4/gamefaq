@@ -1,0 +1,4 @@
+guides/
+__pycache__/
+*.pyc
+.venv/

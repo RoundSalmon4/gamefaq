@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""
+Search GameFAQs for guides by game title.
+
+Displays matching games, their platforms, and available FAQ guides
+with ratings so you can pick the right URL to download.
+
+Uses Playwright to bypass Cloudflare protections.
+
+Usage:
+    python search_faq.py "game title"
+
+Example:
+    python search_faq.py "final fantasy vii"
+    python search_faq.py "zelda" --console snes
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import re
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+from urllib.parse import quote_plus
+
+from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+NAV_TIMEOUT_MS = 60_000
+CLOUDFLARE_POLL_INTERVAL = 0.5
+CLOUDFLARE_MAX_WAIT = 15
+
+_CF_CHALLENGE_INDICATORS = (
+    "text='Verify you are human'",
+    "text='Just a moment'",
+    "#challenge-running",
+    "#cf-challenge-running",
+)
+
+RATING_ORDER = {
+    "Highest Rated": 1,
+    "Most Recommended": 2,
+    "Complete": 3,
+    "Partial": 4,
+    "Unrated": 5,
+}
+
+
+@dataclass
+class FAQGuide:
+    title: str
+    url: str
+    rating: str = "Unrated"
+    rating_rank: int = 5
+
+    def __str__(self) -> str:
+        tag = f" [{self.rating}]" if self.rating != "Unrated" else ""
+        return f"  {self.title}{tag}\n    {self.url}"
+
+
+@dataclass
+class GameResult:
+    title: str
+    platform: str
+    url: str
+    guides: list[FAQGuide] = field(default_factory=list)
+
+    def __str__(self) -> str:
+        return f"{self.title} ({self.platform})\n  {self.url}"
+
+
+def _has_cloudflare_challenge(page: Page) -> bool:
+    for selector in _CF_CHALLENGE_INDICATORS:
+        try:
+            if page.locator(selector).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_for_cloudflare(page: Page) -> None:
+    if not _has_cloudflare_challenge(page):
+        return
+    logger.info("Cloudflare challenge detected - waiting...")
+    deadline = time.monotonic() + CLOUDFLARE_MAX_WAIT
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(int(CLOUDFLARE_POLL_INTERVAL * 1000))
+        if not _has_cloudflare_challenge(page):
+            logger.info("Cloudflare cleared.")
+            return
+    logger.warning("Cloudflare did not clear within %d s.", CLOUDFLARE_MAX_WAIT)
+
+
+def _launch_browser():
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-web-security",
+        ],
+    )
+    context = browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1920, "height": 1080},
+        locale="en-US",
+    )
+    context.add_init_script(
+        """
+        Object.defineProperty(navigator, 'webdriver',
+            { get: () => undefined });
+        Object.defineProperty(navigator, 'plugins',
+            { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages',
+            { get: () => ['en-US', 'en'] });
+        window.chrome = { runtime: {} };
+        """
+    )
+    return pw, browser, context
+
+
+def search_games(query: str, console_filter: str | None = None) -> list[GameResult]:
+    """Search GameFAQs for games matching the query."""
+    pw, browser, context = _launch_browser()
+    try:
+        page = context.new_page()
+        url = f"https://gamefaqs.gamespot.com/search?game={quote_plus(query)}"
+        logger.info("Searching: %s", url)
+
+        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        _wait_for_cloudflare(page)
+
+        time.sleep(2)
+
+        results: list[GameResult] = []
+
+        search_items = page.locator(".search_results .result").all()
+        if not search_items:
+            search_items = page.locator(".sr_result").all()
+        if not search_items:
+            search_items = page.locator("[class*='result']").all()
+
+        if search_items:
+            for item in search_items:
+                try:
+                    title_el = item.locator("a.log_search").first
+                    if title_el.count() == 0:
+                        title_el = item.locator(".sr_name a, .result_name a").first
+                    if title_el.count() == 0:
+                        continue
+
+                    game_title = title_el.inner_text().strip()
+                    game_url = title_el.get_attribute("href") or ""
+                    if game_url and not game_url.startswith("http"):
+                        game_url = f"https://gamefaqs.gamespot.com{game_url}"
+
+                    platform = ""
+                    platform_el = item.locator("a.log_search").all()
+                    for p in platform_el:
+                        text = p.inner_text().strip()
+                        if text and text != game_title:
+                            platform = text
+                            break
+                    if not platform:
+                        platform_el = item.locator(".platform, .sr_product_name").first
+                        if platform_el.count() > 0:
+                            platform = platform_el.inner_text().strip()
+
+                    if console_filter and console_filter.upper() not in platform.upper():
+                        continue
+
+                    results.append(GameResult(
+                        title=game_title,
+                        platform=platform,
+                        url=game_url,
+                    ))
+                except Exception as e:
+                    logger.debug("Error parsing search result: %s", e)
+                    continue
+
+        if not results:
+            logger.info("Trying alternative page structure...")
+            links = page.locator("a[href*='/']").all()
+            seen = set()
+            for link in links:
+                try:
+                    href = link.get_attribute("href") or ""
+                    text = link.inner_text().strip()
+                    if not text or not href:
+                        continue
+                    if "/faqs/" in href:
+                        continue
+                    if href in seen:
+                        continue
+                    if re.search(r"/\d+-", href) and len(text) > 2:
+                        seen.add(href)
+                        full_url = href if href.startswith("http") else f"https://gamefaqs.gamespot.com{href}"
+                        platform_match = re.search(r"^/([^/]+)/\d+-", href)
+                        platform = platform_match.group(1).upper() if platform_match else ""
+                        if console_filter and console_filter.upper() not in platform.upper():
+                            continue
+                        results.append(GameResult(
+                            title=text,
+                            platform=platform.replace("-", " ").title(),
+                            url=full_url,
+                        ))
+                except Exception:
+                    continue
+
+        return results[:20]
+
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def get_faqs(game_url: str) -> list[FAQGuide]:
+    """Fetch the FAQ listing for a game page."""
+    faq_url = game_url.rstrip("/") + "/faqs/"
+    pw, browser, context = _launch_browser()
+    try:
+        page = context.new_page()
+        logger.info("Fetching FAQs from: %s", faq_url)
+
+        page.goto(faq_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        _wait_for_cloudflare(page)
+
+        time.sleep(2)
+
+        guides: list[FAQGuide] = []
+
+        contrib_tables = page.locator("table.contrib").all()
+        if not contrib_tables:
+            contrib_tables = page.locator("table[class*='contrib']").all()
+
+        for table in contrib_tables:
+            rows = table.locator("tbody tr").all()
+            for row in rows:
+                try:
+                    title_cell = row.locator("td.ctitle").first
+                    if title_cell.count() == 0:
+                        continue
+
+                    icon = title_cell.locator("i").first
+                    rating = "Unrated"
+                    if icon.count() > 0:
+                        title_attr = icon.get_attribute("title") or ""
+                        if title_attr:
+                            rating = title_attr
+
+                    link = title_cell.locator("a").first
+                    if link.count() == 0:
+                        link = row.locator("td a[href*='/faqs/']").first
+                    if link.count() == 0:
+                        continue
+
+                    guide_title = link.inner_text().strip()
+                    guide_url = link.get_attribute("href") or ""
+                    if guide_url and not guide_url.startswith("http"):
+                        guide_url = f"https://gamefaqs.gamespot.com{guide_url}"
+
+                    if not guide_title or not guide_url:
+                        continue
+
+                    guides.append(FAQGuide(
+                        title=guide_title,
+                        url=guide_url,
+                        rating=rating,
+                        rating_rank=RATING_ORDER.get(rating, 5),
+                    ))
+                except Exception as e:
+                    logger.debug("Error parsing FAQ row: %s", e)
+                    continue
+
+        if not guides:
+            all_links = page.locator("a[href*='/faqs/']").all()
+            seen_urls = set()
+            for link in all_links:
+                try:
+                    href = link.get_attribute("href") or ""
+                    text = link.inner_text().strip()
+                    if not text or not href or href in seen_urls:
+                        continue
+                    if text.lower() in ("faqs", "guide", "guides", "back"):
+                        continue
+                    seen_urls.add(href)
+                    full_url = href if href.startswith("http") else f"https://gamefaqs.gamespot.com{href}"
+                    guides.append(FAQGuide(
+                        title=text,
+                        url=full_url,
+                        rating="Unrated",
+                        rating_rank=5,
+                    ))
+                except Exception:
+                    continue
+
+        guides.sort(key=lambda g: g.rating_rank)
+        return guides
+
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Search GameFAQs for guides by game title.",
+    )
+    parser.add_argument("query", help="Game title to search for")
+    parser.add_argument(
+        "-c", "--console",
+        help="Filter by console/platform (e.g. snes, ps1, gba)",
+        default=None,
+    )
+    parser.add_argument(
+        "-l", "--list",
+        action="store_true",
+        help="List search results and exit",
+    )
+    parser.add_argument(
+        "-g", "--guides",
+        type=int,
+        metavar="N",
+        help="Show FAQ guides for result #N",
+    )
+    args = parser.parse_args()
+
+    results = search_games(args.query, args.console)
+
+    if not results:
+        print("No games found.")
+        sys.exit(1)
+
+    print(f"\n{'='*60}")
+    print(f" Search results for: {args.query}")
+    if args.console:
+        print(f" Platform filter: {args.console}")
+    print(f"{'='*60}\n")
+
+    for i, game in enumerate(results, 1):
+        print(f"  [{i}] {game}")
+
+    if args.guides:
+        idx = args.guides - 1
+        if idx < 0 or idx >= len(results):
+            print(f"\nInvalid selection. Choose 1-{len(results)}.")
+            sys.exit(1)
+
+        chosen = results[idx]
+        print(f"\n{'='*60}")
+        print(f" FAQs for: {chosen.title} ({chosen.platform})")
+        print(f"{'='*60}\n")
+
+        guides = get_faqs(chosen.url)
+
+        if not guides:
+            print("  No FAQs found for this game.")
+            sys.exit(1)
+
+        for i, guide in enumerate(guides, 1):
+            print(f"  [{i}] {guide}")
+
+        print(f"\n{'='*60}")
+        print(" Copy a URL above and use it with download_faq.py:")
+        print("   python download_faq.py <url>")
+        print(f"{'='*60}\n")
+
+    elif not args.list:
+        print(f"\n  Use -g <number> to view FAQs for a game.")
+        print(f"  Example: python search_faq.py \"{args.query}\" -g 1")
+
+
+if __name__ == "__main__":
+    main()
