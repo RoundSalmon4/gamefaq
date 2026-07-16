@@ -7,7 +7,7 @@ GameFAQs blocks VPN users and has Cloudflare protections, so this project uses P
 ## Workflow
 
 1. **Search** for a game and browse available guides
-2. **Copy** the guide URL you want
+2. **Copy** the guide URL you want (game page URLs work too)
 3. **Download** it via the GitHub Actions workflow or locally
 
 ## Usage (GitHub Actions)
@@ -22,8 +22,10 @@ GameFAQs blocks VPN users and has Cloudflare protections, so this project uses P
 ### Download a guide
 
 1. Go to **Actions** > **Download GameFAQ** > **Run workflow**
-2. Paste the GameFAQ URL from the search results
+2. Paste a GameFAQ URL from the search results
 3. The guide will be downloaded, committed, and pushed to the `guides/` folder
+
+You can use either a direct FAQ URL (with `/faqs/` in the path) or a game page URL — the script will auto-find the top-rated guide.
 
 ## Local Usage
 
@@ -34,8 +36,9 @@ python -m playwright install chromium
 # Search for a game
 python search_faq.py "chrono trigger"
 
-# Download a guide
-python download_faq.py <url>
+# Download a guide (works with both game page and FAQ URLs)
+python download_faq.py https://gamefaqs.gamespot.com/ps1/57080-chrono-trigger
+python download_faq.py https://gamefaqs.gamespot.com/ps1/57080-chrono-trigger/faqs/46950
 ```
 
 ## Search Filters

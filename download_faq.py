@@ -8,8 +8,11 @@ Adapted from https://gist.github.com/alechemy/ed84c5b6b53b5194f1875b96a9a4faf1
 Usage:
     python download_faq.py <url> [-o output_dir]
 
-Example:
+Accepts either a direct FAQ URL or a game page URL (auto-finds top guide).
+
+Examples:
     python download_faq.py https://gamefaqs.gamespot.com/ps/196853-final-fantasy-vii/faqs/57145
+    python download_faq.py https://gamefaqs.gamespot.com/ps/196853-final-fantasy-vii
 """
 
 from __future__ import annotations
@@ -33,8 +36,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-RE_URL = re.compile(
+RE_FAQ_URL = re.compile(
     r"^https?://(www\.)?gamefaqs\.gamespot\.com/.+/faqs/[0-9]{3,8}/?$",
+    re.IGNORECASE,
+)
+
+RE_GAME_URL = re.compile(
+    r"^https?://(www\.)?gamefaqs\.gamespot\.com/[a-z0-9-]+/\d+-[^/?]+/?$",
     re.IGNORECASE,
 )
 
@@ -100,7 +108,7 @@ def _ensure_print_param(url: str) -> str:
 
 def _validate_url(url: str) -> bool:
     base_url = url.split("?")[0]
-    return bool(RE_URL.match(base_url))
+    return bool(RE_FAQ_URL.match(base_url)) or bool(RE_GAME_URL.match(base_url))
 
 
 def _generate_filename(url: str) -> str:
@@ -190,13 +198,109 @@ def _extract_content(page: Page) -> FetchResult | None:
     return None
 
 
+def _resolve_game_url(url: str) -> str:
+    """Given a game page URL, navigate to its FAQs listing and return the
+    top-rated FAQ URL. Returns the original URL if it's already a FAQ URL."""
+    base_url = url.split("?")[0]
+    if RE_FAQ_URL.match(base_url):
+        return url
+
+    faq_listing = base_url.rstrip("/") + "/faqs/"
+    logger.info("Game page URL detected — fetching FAQ listing from %s", faq_listing)
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
+        )
+        try:
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
+            context.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver',
+                    { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins',
+                    { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages',
+                    { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {} };
+                """
+            )
+            page = context.new_page()
+            page.goto(faq_listing, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            _wait_for_cloudflare(page)
+            time.sleep(2)
+
+            page_text = page.inner_text("body")
+            if "Request Blocked" in page_text or "abuse from this hosting" in page_text:
+                raise FAQDownloadError("GameFAQs blocked direct access to the FAQ listing page")
+
+            faq_links = page.locator("a[href*='/faqs/']").all()
+            best_url = None
+            best_rank = 999
+
+            rating_order = {
+                "Highest Rated": 1,
+                "Most Recommended": 2,
+                "Complete": 3,
+                "Partial": 4,
+            }
+
+            for link in faq_links:
+                try:
+                    href = link.get_attribute("href") or ""
+                    if not re.search(r"/faqs/\d+", href):
+                        continue
+                    if not href.startswith("http"):
+                        href = f"https://gamefaqs.gamespot.com{href}"
+
+                    rank = 5
+                    try:
+                        parent = link.locator("xpath=ancestor::tr").first
+                        if parent.count() > 0:
+                            icon = parent.locator("i[title]").first
+                            if icon.count() > 0:
+                                title_attr = icon.get_attribute("title") or ""
+                                rank = rating_order.get(title_attr, 5)
+                    except Exception:
+                        pass
+
+                    if rank < best_rank:
+                        best_rank = rank
+                        best_url = href
+                except Exception:
+                    continue
+
+            if best_url:
+                logger.info("Auto-selected FAQ: %s (rank %d)", best_url, best_rank)
+                return best_url
+
+            raise FAQDownloadError(
+                f"Could not find any FAQ guides on the game page. "
+                f"Try providing a direct FAQ URL instead."
+            )
+        finally:
+            browser.close()
+
+
 class FAQDownloader:
     def __init__(self, url: str, output_dir: str = ".") -> None:
+        base_url = url.split("?")[0]
         if not _validate_url(url):
             raise FAQDownloadError(
-                f"Invalid URL - must be a GameFAQs FAQ URL. Got: {url}"
+                f"Invalid URL — expected a GameFAQs FAQ or game page URL. Got: {url}"
             )
-        self.url = _ensure_print_param(url)
+        self.url = _resolve_game_url(url)
+        self.url = _ensure_print_param(self.url)
         self.output_dir = os.path.expanduser(output_dir)
 
     def fetch_and_save(self) -> str:

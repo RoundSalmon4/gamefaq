@@ -728,6 +728,8 @@ def format_markdown(query: str, console_filter: str | None,
     lines.append("python download_faq.py <url>")
     lines.append("```")
     lines.append("")
+    lines.append("_Works with both game page URLs and direct FAQ links._")
+    lines.append("")
 
     return "\n".join(lines)
 
