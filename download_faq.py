@@ -74,14 +74,18 @@ _JUNK_PATTERNS: list[re.Pattern[str]] = [
         r"We also share information about your use of our site",
         r"\[Privacy Policy\]",
         r"^\s*Just a moment\s*$",
+        r"Performing security verification",
+        r"security service to protect against",
     )
 ]
 
 _CF_CHALLENGE_INDICATORS = (
     "text='Verify you are human'",
     "text='Just a moment'",
+    "text='Performing security verification'",
     "#challenge-running",
     "#cf-challenge-running",
+    "#challenge-stage",
 )
 
 _CONTENT_SELECTORS = '[id^="faqspan-"], .faqtext, #content, pre'
@@ -280,9 +284,13 @@ def _resolve_game_url(url: str) -> str:
                         continue
                     if not re.search(r"/faqs/\d+", href):
                         continue
-                    seen.add(href)
                     if not href.startswith("http"):
                         href = f"https://gamefaqs.gamespot.com{href}"
+                    # Strip chapter slugs — keep only /faqs/<id>
+                    href = re.sub(r"(/faqs/\d+).*", r"\1", href)
+                    if href in seen:
+                        continue
+                    seen.add(href)
 
                     rank = 5
                     try:
@@ -419,6 +427,18 @@ class FAQDownloader:
                 if result is None or len(result.content.strip()) < MIN_CONTENT_LENGTH:
                     raise FAQDownloadError(
                         "Extracted content was empty or too short."
+                    )
+                # Check if we got a Cloudflare security page instead of FAQ content
+                page_text = result.content.lower()
+                if "performing security verification" in page_text or (
+                    "cloudflare" in page_text
+                    and "faqspan-" not in page_text
+                    and ".faqtext" not in page_text
+                ):
+                    raise FAQDownloadError(
+                        "Cloudflare blocked the download — this typically happens "
+                        "from CI runners. Try downloading locally instead:\n"
+                        f"  python download_faq.py {self.url.split('?')[0]}"
                     )
                 return result
             except FAQDownloadError:
