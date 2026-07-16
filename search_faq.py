@@ -60,6 +60,10 @@ RATING_ORDER = {
     "Unrated": 5,
 }
 
+# Set to True after first "Request Blocked" detection to skip direct GameFAQs
+# access for the rest of the session (always blocked from datacenter IPs).
+_direct_access_blocked = False
+
 
 @dataclass
 class FAQGuide:
@@ -253,36 +257,45 @@ def search_games(query: str, console_filter: str | None = None,
                     continue
 
                 if _is_gamefaqs_faq_page(href):
-                    # This is a direct FAQ link — wrap it in a GameResult
-                    results.append(GameResult(
-                        title=f"{slug_title} (FAQ: {title})",
-                        platform=platform,
-                        url=href,
-                    ))
+                    # Extract the base game URL from this FAQ sub-page
+                    game_base = re.sub(r'/faqs/.*$', '', href).rstrip("/")
+                    if game_base not in seen_urls:
+                        # First time seeing this game — add it as a game result
+                        results.append(GameResult(
+                            title=slug_title,
+                            platform=platform,
+                            url=game_base,
+                        ))
+                        seen_urls.add(game_base)
                 elif _is_gamefaqs_game_page(href):
-                    results.append(GameResult(
-                        title=title,
-                        platform=platform,
-                        url=href,
-                    ))
+                    if href not in seen_urls:
+                        results.append(GameResult(
+                            title=title,
+                            platform=platform,
+                            url=href,
+                        ))
+                        seen_urls.add(href)
                 else:
                     # Some other gamefaqs page (FAQ listing, etc.)
-                    results.append(GameResult(
-                        title=title,
-                        platform=platform,
-                        url=href,
-                    ))
+                    if href not in seen_urls:
+                        results.append(GameResult(
+                            title=title,
+                            platform=platform,
+                            url=href,
+                        ))
+                        seen_urls.add(href)
 
             except Exception as e:
                 logger.debug("Error parsing link: %s", e)
                 continue
 
-        # Deduplicate by URL (keep first occurrence)
+        # Deduplicate by game base URL (keep first occurrence)
         unique: list[GameResult] = []
-        deduped_urls: set[str] = set()
+        deduped_bases: set[str] = set()
         for r in results:
-            if r.url not in deduped_urls:
-                deduped_urls.add(r.url)
+            base = re.sub(r'/faqs/.*$', '', r.url).rstrip("/")
+            if base not in deduped_bases:
+                deduped_bases.add(base)
                 unique.append(r)
         results = unique
 
@@ -311,23 +324,31 @@ def search_games(query: str, console_filter: str | None = None,
                         if not slug:
                             continue
                         slug_title = re.sub(r"^\d+-", "", slug).replace("-", " ").title()
-                        title = link_el.inner_text().strip()
+                        title = _clean_title(link_el.inner_text())
                         if not title or len(title) < 3 or title.lower() in ("gamefaqs", "gamefaqs.com"):
                             title = slug_title
                         if console_filter and console_filter.upper() not in platform.upper():
                             continue
-                        results.append(GameResult(title=title, platform=platform, url=href))
+                        # Collapse FAQ sub-pages to their game base URL
+                        if _is_gamefaqs_faq_page(href):
+                            game_base = re.sub(r'/faqs/.*$', '', href).rstrip("/")
+                            if game_base not in seen_urls:
+                                seen_urls.add(game_base)
+                                results.append(GameResult(title=slug_title, platform=platform, url=game_base))
+                        else:
+                            results.append(GameResult(title=title, platform=platform, url=href))
                     except Exception:
                         continue
 
                 if results:
                     logger.info("Startpage fallback found %d results", len(results))
-                    # Deduplicate again
+                    # Deduplicate by game base URL
                     unique2: list[GameResult] = []
-                    seen2: set[str] = set()
+                    seen_bases2: set[str] = set()
                     for r in results:
-                        if r.url not in seen2:
-                            seen2.add(r.url)
+                        base = re.sub(r'/faqs/.*$', '', r.url).rstrip("/")
+                        if base not in seen_bases2:
+                            seen_bases2.add(base)
                             unique2.append(r)
                     results = unique2
 
@@ -343,6 +364,9 @@ def search_games(query: str, console_filter: str | None = None,
 
 def _fetch_faqs_direct(faq_url: str) -> list[FAQGuide]:
     """Try to fetch FAQ listing directly from GameFAQs."""
+    global _direct_access_blocked
+    if _direct_access_blocked:
+        return []
     pw, browser, context = _launch_browser()
     try:
         page = context.new_page()
@@ -423,7 +447,8 @@ def _fetch_faqs_direct(faq_url: str) -> list[FAQGuide]:
         # Check if we got blocked
         page_text = page.inner_text("body")
         if "Request Blocked" in page_text or "abuse from this hosting" in page_text:
-            logger.warning("GameFAQs blocked direct access (datacenter IP detected)")
+            _direct_access_blocked = True
+            logger.warning("GameFAQs blocked direct access — skipping for rest of session")
             return []
 
         guides.sort(key=lambda g: g.rating_rank)
@@ -592,27 +617,47 @@ def _search_faqs_via_startpage(game_title: str, platform: str = "",
 
 def get_faqs(game_url: str, game_title: str = "",
              platform: str = "", debug: bool = False) -> list[FAQGuide]:
-    """Fetch the FAQ listing for a game. Falls back to Google if GameFAQs blocks direct access."""
-    faq_url = game_url.rstrip("/") + "/faqs/"
+    """Fetch the FAQ listing for a game. Falls back to Brave/Startpage if blocked."""
+    global _direct_access_blocked
 
-    # Try direct access first
-    guides = _fetch_faqs_direct(faq_url)
-    if guides:
-        return guides
+    # Clean the game title — strip FAQ sub-page noise like "(FAQ: ... Walkthrough...)"
+    clean_title = re.sub(r'\s*\(FAQ:.*', '', game_title).strip()
+    # Also strip generic suffixes
+    clean_title = re.sub(r'\s*(FAQs?, Walkthroughs?,? and Guides? for )', '', clean_title).strip()
+    clean_title = re.sub(r'\s*-\s*GameFAQs$', '', clean_title).strip()
+
+    # Extract the base game URL (strip any /faqs/... sub-path)
+    base_url = re.sub(r'/faqs/.*$', '', game_url).rstrip("/")
+    faq_url = base_url + "/faqs/"
+
+    # Try direct access first (unless already known blocked)
+    if not _direct_access_blocked:
+        guides = _fetch_faqs_direct(faq_url)
+        if guides:
+            return guides
 
     # Direct access blocked — try Brave, then Startpage
-    logger.info("Direct access blocked, trying search engine fallback...")
-    if not game_title:
-        gm = re.search(r"/\d+-([^/]+)", game_url)
-        if gm:
-            game_title = gm.group(1).replace("-", " ").title()
+    if not _direct_access_blocked:
+        logger.info("Direct access blocked, trying search engine fallback...")
 
-    guides = _search_faqs_via_brave(game_title, platform, debug)
+    # Use the clean title for search, falling back to URL-derived title
+    search_title = clean_title
+    if not search_title or len(search_title) < 3:
+        gm = re.search(r"/\d+-([^/]+)", base_url)
+        if gm:
+            search_title = gm.group(1).replace("-", " ").title()
+
+    if not platform:
+        pm = re.search(r"gamefaqs\.gamespot\.com/([a-z0-9-]+)/\d+", base_url)
+        if pm:
+            platform = pm.group(1).replace("-", " ").title()
+
+    guides = _search_faqs_via_brave(search_title, platform, debug)
     if guides:
         return guides
 
     logger.info("Brave returned nothing, trying Startpage...")
-    return _search_faqs_via_startpage(game_title, platform, debug)
+    return _search_faqs_via_startpage(search_title, platform, debug)
 
 
 def format_markdown(query: str, console_filter: str | None,
