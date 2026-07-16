@@ -108,12 +108,12 @@ def _generate_filename(url: str) -> str:
             console = parts[0]
             game = parts[1]
             faq_id = parts[-1]
-            return f"{console}-{game}-faq-{faq_id}.txt"
+            return f"{console}-{game}-faq-{faq_id}.md"
         elif len(parts) >= 2:
-            return f"{parts[1]}.txt"
+            return f"{parts[1]}.md"
     except Exception:
         pass
-    return "gamefaqs_download.txt"
+    return "gamefaqs_download.md"
 
 
 def _clean_content(text: str) -> str:
