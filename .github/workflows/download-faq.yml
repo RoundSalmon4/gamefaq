@@ -19,6 +19,17 @@ jobs:
     permissions:
       contents: write
 
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: >-
+          --health-cmd "curl -f http://localhost:8191/ || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -35,8 +46,21 @@ jobs:
           python -m playwright install chromium
           python -m playwright install-deps
 
+      - name: Wait for FlareSolverr
+        run: |
+          echo "Waiting for FlareSolverr to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8191/ > /dev/null 2>&1; then
+              echo "FlareSolverr is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "FlareSolverr failed to start within 60s"
+          exit 1
+
       - name: Download FAQ
-        run: python download_faq.py "${{ inputs.faq_url }}" -o guides
+        run: python download_faq.py "${{ inputs.faq_url }}" -o guides --flaresolverr http://localhost:8191
 
       - name: Commit and push
         run: |

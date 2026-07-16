@@ -27,6 +27,7 @@ from typing import NamedTuple
 from urllib.parse import parse_qs, quote_plus, urlencode, urlparse, urlunparse
 
 import html2text
+import requests as http_requests
 from playwright.sync_api import Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -325,7 +326,8 @@ def _resolve_game_url(url: str) -> str:
 
 
 class FAQDownloader:
-    def __init__(self, url: str, output_dir: str = ".") -> None:
+    def __init__(self, url: str, output_dir: str = ".",
+                 flaresolverr_url: str | None = None) -> None:
         base_url = url.split("?")[0]
         if not _validate_url(url):
             raise FAQDownloadError(
@@ -334,6 +336,7 @@ class FAQDownloader:
         self.url = _resolve_game_url(url)
         self.url = _ensure_single_param(self.url)
         self.output_dir = os.path.expanduser(output_dir)
+        self.flaresolverr_url = flaresolverr_url
 
     def fetch_and_save(self) -> str:
         result = self._fetch_with_retries()
@@ -356,6 +359,8 @@ class FAQDownloader:
         last_err: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
+                if self.flaresolverr_url:
+                    return self._fetch_content_flaresolverr()
                 return self._fetch_content_playwright()
             except FAQDownloadError as exc:
                 last_err = exc
@@ -369,6 +374,110 @@ class FAQDownloader:
         raise FAQDownloadError(
             f"All {MAX_RETRIES} attempt(s) failed."
         ) from last_err
+
+    def _fetch_content_flaresolverr(self) -> FetchResult:
+        """Fetch via FlareSolverr. Try lightweight cookies-first approach,
+        then fall back to full FlareSolverr HTML response."""
+        api_url = f"{self.flaresolverr_url}/v1"
+        headers = {"Content-Type": "application/json"}
+
+        logger.info("Trying FlareSolverr (cookies-first) for %s", self.url)
+
+        # --- Lightweight approach: get cookies, then use requests ---
+        try:
+            session_id = f"gfq-{int(time.time())}"
+            # Create a FlareSolverr session
+            create_resp = http_requests.post(
+                api_url, headers=headers,
+                json={"cmd": "sessions.create", "session": session_id},
+                timeout=30,
+            )
+            if create_resp.status_code == 200:
+                session_data = create_resp.json()
+                if session_data.get("status") == "ok":
+                    # Get cookies from a request to the game page
+                    base_url = re.sub(r"/faqs/.*$", "", self.url.split("?")[0]).rstrip("/")
+                    cookie_resp = http_requests.post(
+                        api_url, headers=headers,
+                        json={
+                            "cmd": "request.get",
+                            "url": base_url,
+                            "session": session_id,
+                            "maxTimeout": 60000,
+                            "returnOnlyCookies": True,
+                        },
+                        timeout=90,
+                    )
+                    if cookie_resp.status_code == 200:
+                        cookie_data = cookie_resp.json()
+                        if cookie_data.get("status") == "ok":
+                            cookies = {
+                                c["name"]: c["value"]
+                                for c in cookie_data["solution"]["cookies"]
+                            }
+                            user_agent = cookie_data["solution"].get("userAgent", USER_AGENT)
+
+                            # Use requests with the cookies
+                            logger.info("Got %d cookies from FlareSolverr, fetching with requests", len(cookies))
+                            resp = http_requests.get(
+                                self.url, cookies=cookies,
+                                headers={"User-Agent": user_agent},
+                                timeout=30,
+                            )
+                            resp.raise_for_status()
+                            html = resp.text
+                            if len(html) >= MIN_CONTENT_LENGTH and "performing security verification" not in html.lower():
+                                logger.info("Lightweight fetch succeeded (%d bytes)", len(html))
+                                # Cleanup session
+                                try:
+                                    http_requests.post(
+                                        api_url, headers=headers,
+                                        json={"cmd": "sessions.destroy", "session": session_id},
+                                        timeout=10,
+                                    )
+                                except Exception:
+                                    pass
+                                return FetchResult(content=html, is_html=True)
+
+                    logger.info("Lightweight fetch failed, trying full FlareSolverr response")
+                    # Cleanup session before fallback
+                    try:
+                        http_requests.post(
+                            api_url, headers=headers,
+                            json={"cmd": "sessions.destroy", "session": session_id},
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("Lightweight FlareSolverr approach failed: %s", exc)
+
+        # --- Full fallback: get HTML directly from FlareSolverr ---
+        logger.info("Trying full FlareSolverr response for %s", self.url)
+        resp = http_requests.post(
+            api_url, headers=headers,
+            json={
+                "cmd": "request.get",
+                "url": self.url,
+                "maxTimeout": 60000,
+            },
+            timeout=90,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != "ok":
+            raise FAQDownloadError(
+                f"FlareSolverr returned status: {data.get('status')} — {data.get('message', '')}"
+            )
+        html = data["solution"]["response"]
+        if len(html) < MIN_CONTENT_LENGTH:
+            raise FAQDownloadError("FlareSolverr returned empty or too-short content.")
+        if "performing security verification" in html.lower():
+            raise FAQDownloadError(
+                "Cloudflare blocked the download even via FlareSolverr."
+            )
+        logger.info("Full FlareSolverr fetch succeeded (%d bytes)", len(html))
+        return FetchResult(content=html, is_html=True)
 
     def _fetch_content_playwright(self) -> FetchResult:
         logger.info("Navigating to %s ...", self.url)
@@ -458,9 +567,15 @@ def main() -> None:
         "-o", "--output", default="guides",
         help="Output directory (default: guides/)",
     )
+    parser.add_argument(
+        "-f", "--flaresolverr", default=None, metavar="URL",
+        help="FlareSolverr server URL (e.g. http://localhost:8191) "
+             "to bypass Cloudflare protection",
+    )
     args = parser.parse_args()
     try:
-        downloader = FAQDownloader(args.url, args.output)
+        downloader = FAQDownloader(args.url, args.output,
+                                   flaresolverr_url=args.flaresolverr)
         filepath = downloader.fetch_and_save()
         print(filepath)
     except FAQDownloadError as exc:
