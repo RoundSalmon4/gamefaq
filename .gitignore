@@ -2,8 +2,7 @@ guides/
 __pycache__/
 *.pyc
 .venv/
-debug_page.html
-debug_google_faqs.html
+debug_*.html
 debug-artifact/
 debug-artifact.zip
 logs/
