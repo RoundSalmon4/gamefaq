@@ -259,14 +259,23 @@ def search_games(query: str, console_filter: str | None = None,
                 if _is_gamefaqs_faq_page(href):
                     # Extract the base game URL from this FAQ sub-page
                     game_base = re.sub(r'/faqs/.*$', '', href).rstrip("/")
+                    faq_title = title
+                    faq_url = href if href.startswith("http") else f"https://gamefaqs.gamespot.com{href}"
                     if game_base not in seen_urls:
                         # First time seeing this game — add it as a game result
                         results.append(GameResult(
                             title=slug_title,
                             platform=platform,
                             url=game_base,
+                            guides=[FAQGuide(title=faq_title, url=faq_url)],
                         ))
                         seen_urls.add(game_base)
+                    else:
+                        # Already have this game — append this FAQ as a pre-discovered guide
+                        for r in results:
+                            if r.url == game_base:
+                                r.guides.append(FAQGuide(title=faq_title, url=faq_url))
+                                break
                 elif _is_gamefaqs_game_page(href):
                     if href not in seen_urls:
                         results.append(GameResult(
@@ -332,9 +341,18 @@ def search_games(query: str, console_filter: str | None = None,
                         # Collapse FAQ sub-pages to their game base URL
                         if _is_gamefaqs_faq_page(href):
                             game_base = re.sub(r'/faqs/.*$', '', href).rstrip("/")
+                            faq_url = href if href.startswith("http") else f"https://gamefaqs.gamespot.com{href}"
                             if game_base not in seen_urls:
                                 seen_urls.add(game_base)
-                                results.append(GameResult(title=slug_title, platform=platform, url=game_base))
+                                results.append(GameResult(
+                                    title=slug_title, platform=platform, url=game_base,
+                                    guides=[FAQGuide(title=title, url=faq_url)],
+                                ))
+                            else:
+                                for r in results:
+                                    if r.url == game_base:
+                                        r.guides.append(FAQGuide(title=title, url=faq_url))
+                                        break
                         else:
                             results.append(GameResult(title=title, platform=platform, url=href))
                     except Exception:
@@ -616,9 +634,15 @@ def _search_faqs_via_startpage(game_title: str, platform: str = "",
 
 
 def get_faqs(game_url: str, game_title: str = "",
-             platform: str = "", debug: bool = False) -> list[FAQGuide]:
+             platform: str = "", debug: bool = False,
+             pre_discovered: list[FAQGuide] | None = None) -> list[FAQGuide]:
     """Fetch the FAQ listing for a game. Falls back to Brave/Startpage if blocked."""
     global _direct_access_blocked
+
+    # If the initial search already found FAQ URLs, use those directly
+    if pre_discovered:
+        logger.info("Using %d pre-discovered FAQ URLs from search", len(pre_discovered))
+        return pre_discovered
 
     # Clean the game title — strip FAQ sub-page noise like "(FAQ: ... Walkthrough...)"
     clean_title = re.sub(r'\s*\(FAQ:.*', '', game_title).strip()
@@ -765,14 +789,16 @@ def main() -> None:
             sys.exit(1)
         game = results[idx]
         guides_map[args.guides] = get_faqs(
-            game.url, game.title, game.platform, args.debug
+            game.url, game.title, game.platform, args.debug,
+            pre_discovered=game.guides or None,
         )
 
     if args.all_guides:
         for i, game in enumerate(results, 1):
             logger.info("Fetching guides for [%d] %s...", i, game.title)
             guides_map[i] = get_faqs(
-                game.url, game.title, game.platform, args.debug
+                game.url, game.title, game.platform, args.debug,
+                pre_discovered=game.guides or None,
             )
 
     if args.markdown:
