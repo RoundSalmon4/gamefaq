@@ -24,7 +24,7 @@ import re
 import sys
 import time
 from typing import NamedTuple
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote_plus, urlencode, urlparse, urlunparse
 
 import html2text
 from playwright.sync_api import Page, sync_playwright
@@ -199,14 +199,26 @@ def _extract_content(page: Page) -> FetchResult | None:
 
 
 def _resolve_game_url(url: str) -> str:
-    """Given a game page URL, navigate to its FAQs listing and return the
-    top-rated FAQ URL. Returns the original URL if it's already a FAQ URL."""
+    """Given a game page URL, find the best FAQ URL and return it.
+    Uses Brave Search to avoid direct access blocks from datacenter IPs.
+    Returns the original URL if it's already a FAQ URL."""
     base_url = url.split("?")[0]
     if RE_FAQ_URL.match(base_url):
         return url
 
-    faq_listing = base_url.rstrip("/") + "/faqs/"
-    logger.info("Game page URL detected — fetching FAQ listing from %s", faq_listing)
+    logger.info("Game page URL detected — searching Brave for FAQs")
+
+    platform, slug = "", ""
+    m = re.search(r"gamefaqs\.gamespot\.com/([a-z0-9-]+)/(\d+-[^/?]+)", base_url)
+    if m:
+        platform = m.group(1).replace("-", " ")
+        slug = m.group(2)
+
+    game_title = re.sub(r"^\d+-", "", slug).replace("-", " ").title() if slug else ""
+    if not game_title:
+        raise FAQDownloadError(
+            f"Could not extract game title from URL: {url}"
+        )
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -236,23 +248,32 @@ def _resolve_game_url(url: str) -> str:
                 """
             )
             page = context.new_page()
-            page.goto(faq_listing, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-            _wait_for_cloudflare(page)
-            time.sleep(2)
 
-            page_text = page.inner_text("body")
-            if "Request Blocked" in page_text or "abuse from this hosting" in page_text:
-                raise FAQDownloadError("GameFAQs blocked direct access to the FAQ listing page")
+            site_part = "site:gamefaqs.gamespot.com/faqs/"
+            query = f"{site_part} {game_title}"
+            if platform:
+                query += f" {platform.lower().replace(' ', '-')}"
+            brave_url = f"https://search.brave.com/search?q={quote_plus(query)}"
+            logger.info("Searching Brave: %s", query)
+            page.goto(brave_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            try:
+                page.wait_for_selector(
+                    "a[href*='gamefaqs.gamespot.com/faqs/']",
+                    timeout=15_000,
+                )
+            except PlaywrightTimeoutError:
+                pass
+            time.sleep(1)
 
-            faq_links = page.locator("a[href*='/faqs/']").all()
+            faq_links = page.locator("a[href*='gamefaqs.gamespot.com/faqs/']").all()
             best_url = None
             best_rank = 999
 
             rating_order = {
-                "Highest Rated": 1,
-                "Most Recommended": 2,
-                "Complete": 3,
-                "Partial": 4,
+                "highest rated": 1,
+                "most recommended": 2,
+                "complete": 3,
+                "partial": 4,
             }
 
             for link in faq_links:
@@ -265,12 +286,15 @@ def _resolve_game_url(url: str) -> str:
 
                     rank = 5
                     try:
-                        parent = link.locator("xpath=ancestor::tr").first
+                        parent = link.locator(
+                            "xpath=ancestor::div[contains(@class,'snippet') or contains(@class,'result')]"
+                        ).first
                         if parent.count() > 0:
-                            icon = parent.locator("i[title]").first
-                            if icon.count() > 0:
-                                title_attr = icon.get_attribute("title") or ""
-                                rank = rating_order.get(title_attr, 5)
+                            snippet = parent.inner_text().strip().lower()
+                            for kw, r in rating_order.items():
+                                if kw in snippet:
+                                    rank = r
+                                    break
                     except Exception:
                         pass
 
@@ -285,7 +309,7 @@ def _resolve_game_url(url: str) -> str:
                 return best_url
 
             raise FAQDownloadError(
-                f"Could not find any FAQ guides on the game page. "
+                f"Could not find any FAQ guides for '{game_title}'. "
                 f"Try providing a direct FAQ URL instead."
             )
         finally:
