@@ -1,0 +1,7 @@
+# Request Blocked
+
+Due to abuse from this hosting service, all interactive traffic is blocked.
+
+If you are running a legitimate crawler/robot, please ensure that it properly identifies itself via the user agent with a contact site or email address.
+
+If you are a person and not a robot, please disable your VPN/proxy server to continue.
