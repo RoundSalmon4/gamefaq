@@ -208,11 +208,10 @@ def _resolve_game_url(url: str) -> str:
 
     logger.info("Game page URL detected — searching Brave for FAQs")
 
-    platform, slug = "", ""
-    m = re.search(r"gamefaqs\.gamespot\.com/([a-z0-9-]+)/(\d+-[^/?]+)", base_url)
+    slug = ""
+    m = re.search(r"gamefaqs\.gamespot\.com/[a-z0-9-]+/(\d+-[^/?]+)", base_url)
     if m:
-        platform = m.group(1).replace("-", " ")
-        slug = m.group(2)
+        slug = m.group(1)
 
     game_title = re.sub(r"^\d+-", "", slug).replace("-", " ").title() if slug else ""
     if not game_title:
@@ -249,23 +248,20 @@ def _resolve_game_url(url: str) -> str:
             )
             page = context.new_page()
 
-            site_part = "site:gamefaqs.gamespot.com/faqs/"
-            query = f"{site_part} {game_title}"
-            if platform:
-                query += f" {platform.lower().replace(' ', '-')}"
+            query = f"site:gamefaqs.gamespot.com {game_title}"
             brave_url = f"https://search.brave.com/search?q={quote_plus(query)}"
             logger.info("Searching Brave: %s", query)
             page.goto(brave_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
             try:
                 page.wait_for_selector(
-                    "a[href*='gamefaqs.gamespot.com/faqs/']",
+                    "a[href*='gamefaqs.gamespot.com']",
                     timeout=15_000,
                 )
             except PlaywrightTimeoutError:
                 pass
             time.sleep(1)
 
-            faq_links = page.locator("a[href*='gamefaqs.gamespot.com/faqs/']").all()
+            all_links = page.locator("a[href*='gamefaqs.gamespot.com']").all()
             best_url = None
             best_rank = 999
 
@@ -276,11 +272,15 @@ def _resolve_game_url(url: str) -> str:
                 "partial": 4,
             }
 
-            for link in faq_links:
+            seen: set[str] = set()
+            for link in all_links:
                 try:
                     href = link.get_attribute("href") or ""
+                    if not href or href in seen:
+                        continue
                     if not re.search(r"/faqs/\d+", href):
                         continue
+                    seen.add(href)
                     if not href.startswith("http"):
                         href = f"https://gamefaqs.gamespot.com{href}"
 
