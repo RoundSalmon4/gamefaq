@@ -50,7 +50,15 @@ jobs:
             GUIDES_FLAG="--all-guides"
           fi
 
-          python search_faq.py "${{ inputs.query }}" $CONSOLE_FLAG $GUIDES_FLAG --markdown > summary.md
+          python search_faq.py "${{ inputs.query }}" $CONSOLE_FLAG $GUIDES_FLAG --markdown --debug > summary.md || true
+
+      - name: Upload debug HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html
+          path: debug_page.html
+          if-no-files-found: ignore
 
       - name: Write job summary
         run: cat summary.md >> $GITHUB_STEP_SUMMARY

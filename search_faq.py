@@ -135,7 +135,30 @@ def _launch_browser():
     return pw, browser, context
 
 
-def search_games(query: str, console_filter: str | None = None) -> list[GameResult]:
+def _dump_debug_html(page: Page, path: str = "debug_page.html") -> None:
+    """Save the current page HTML for debugging."""
+    try:
+        html = page.content()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        logger.info("Debug HTML saved to %s (%d bytes)", path, len(html))
+    except Exception as e:
+        logger.debug("Failed to save debug HTML: %s", e)
+
+
+def _wait_for_content(page: Page, timeout_ms: int = 10_000) -> bool:
+    """Wait until the page has meaningful content (not just Cloudflare)."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        text = page.inner_text("body")
+        if len(text.strip()) > 200 and "verify you are human" not in text.lower():
+            return True
+        page.wait_for_timeout(500)
+    return False
+
+
+def search_games(query: str, console_filter: str | None = None,
+                 debug: bool = False) -> list[GameResult]:
     """Search GameFAQs for games matching the query."""
     pw, browser, context = _launch_browser()
     try:
@@ -143,25 +166,54 @@ def search_games(query: str, console_filter: str | None = None) -> list[GameResu
         url = f"https://gamefaqs.gamespot.com/search?game={quote_plus(query)}"
         logger.info("Searching: %s", url)
 
-        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
         _wait_for_cloudflare(page)
 
-        time.sleep(2)
+        if not _wait_for_content(page, timeout_ms=15_000):
+            logger.warning("Page did not load content within timeout.")
+            if debug:
+                _dump_debug_html(page)
+            return []
+
+        time.sleep(1)
 
         results: list[GameResult] = []
 
-        search_items = page.locator(".search_results .result").all()
-        if not search_items:
-            search_items = page.locator(".sr_result").all()
-        if not search_items:
-            search_items = page.locator("[class*='result']").all()
+        # Try multiple selector strategies
+        selector_strategies = [
+            # Strategy 1: Direct search result items
+            lambda: page.locator(".search_results .result, .result_box").all(),
+            # Strategy 2: sr_ prefixed classes (older GameFAQs layout)
+            lambda: page.locator(".sr_result, .search-result").all(),
+            # Strategy 3: Any element with result-related class
+            lambda: page.locator("[class*='search'] [class*='result'], [class*='search'] [class*='item']").all(),
+            # Strategy 4: Table rows in search results
+            lambda: page.locator("table.results tr, .search-results tr").all(),
+            # Strategy 5: Card-like containers
+            lambda: page.locator(".card, .game-card, .search-card").all(),
+            # Strategy 6: Game links with platform info nearby
+            lambda: page.locator("a[href*='gamefaqs.gamespot.com'][class*='log']").all(),
+        ]
 
-        if search_items:
+        for strategy_idx, strategy in enumerate(selector_strategies):
+            try:
+                search_items = strategy()
+            except Exception:
+                continue
+
+            if not search_items or len(search_items) < 1:
+                continue
+
+            logger.info("Strategy %d found %d items", strategy_idx + 1, len(search_items))
+
             for item in search_items:
                 try:
+                    # Try to find the game title link
                     title_el = item.locator("a.log_search").first
                     if title_el.count() == 0:
-                        title_el = item.locator(".sr_name a, .result_name a").first
+                        title_el = item.locator(".sr_name a, .result_name a, .title a").first
+                    if title_el.count() == 0:
+                        title_el = item.locator("a[href*='gamefaqs.gamespot.com']").first
                     if title_el.count() == 0:
                         continue
 
@@ -170,58 +222,88 @@ def search_games(query: str, console_filter: str | None = None) -> list[GameResu
                     if game_url and not game_url.startswith("http"):
                         game_url = f"https://gamefaqs.gamespot.com{game_url}"
 
+                    if not game_title or len(game_title) < 2:
+                        continue
+
+                    # Try to find the platform
                     platform = ""
-                    platform_el = item.locator("a.log_search").all()
-                    for p in platform_el:
-                        text = p.inner_text().strip()
-                        if text and text != game_title:
-                            platform = text
-                            break
+                    platform_selectors = [
+                        ".platform", ".sr_product_name", ".console",
+                        ".details dt", ".badge", "[class*='platform']",
+                        "[class*='console']",
+                    ]
+                    for ps in platform_selectors:
+                        pel = item.locator(ps).first
+                        if pel.count() > 0:
+                            platform = pel.inner_text().strip()
+                            if platform:
+                                break
+
                     if not platform:
-                        platform_el = item.locator(".platform, .sr_product_name").first
-                        if platform_el.count() > 0:
-                            platform = platform_el.inner_text().strip()
+                        # Try to extract platform from URL
+                        platform_match = re.search(
+                            r"gamefaqs\.gamespot\.com/([^/]+)/\d+-", game_url
+                        )
+                        if platform_match:
+                            platform = platform_match.group(1).replace("-", " ").title()
 
                     if console_filter and console_filter.upper() not in platform.upper():
                         continue
 
-                    results.append(GameResult(
-                        title=game_title,
-                        platform=platform,
-                        url=game_url,
-                    ))
+                    # Deduplicate by URL
+                    if not any(r.url == game_url for r in results):
+                        results.append(GameResult(
+                            title=game_title,
+                            platform=platform,
+                            url=game_url,
+                        ))
                 except Exception as e:
                     logger.debug("Error parsing search result: %s", e)
                     continue
 
+            if results:
+                break
+
+        # Final fallback: scan all links for game-like URLs
         if not results:
-            logger.info("Trying alternative page structure...")
-            links = page.locator("a[href*='/']").all()
-            seen = set()
-            for link in links:
+            logger.info("Trying link-scanning fallback...")
+            all_links = page.locator("a[href*='/']").all()
+            seen_urls: set[str] = set()
+            for link in all_links:
                 try:
                     href = link.get_attribute("href") or ""
                     text = link.inner_text().strip()
-                    if not text or not href:
+                    if not text or not href or href in seen_urls:
                         continue
-                    if "/faqs/" in href:
+                    if "/faqs/" in href or "/search" in href:
                         continue
-                    if href in seen:
+                    if len(text) < 3:
                         continue
-                    if re.search(r"/\d+-", href) and len(text) > 2:
-                        seen.add(href)
-                        full_url = href if href.startswith("http") else f"https://gamefaqs.gamespot.com{href}"
-                        platform_match = re.search(r"^/([^/]+)/\d+-", href)
-                        platform = platform_match.group(1).upper() if platform_match else ""
-                        if console_filter and console_filter.upper() not in platform.upper():
-                            continue
+
+                    # Match game page URLs: /platform/NNNNN-game-name
+                    game_match = re.search(r"/([a-z0-9-]+)/(\d+-[^/]+)", href)
+                    if not game_match:
+                        continue
+
+                    seen_urls.add(href)
+                    full_url = href if href.startswith("http") else f"https://gamefaqs.gamespot.com{href}"
+                    platform = game_match.group(1).replace("-", " ").title()
+
+                    if console_filter and console_filter.upper() not in platform.upper():
+                        continue
+
+                    if not any(r.url == full_url for r in results):
                         results.append(GameResult(
                             title=text,
-                            platform=platform.replace("-", " ").title(),
+                            platform=platform,
                             url=full_url,
                         ))
                 except Exception:
                     continue
+
+        if not results:
+            if debug:
+                _dump_debug_html(page)
 
         return results[:20]
 
@@ -397,9 +479,14 @@ def main() -> None:
         action="store_true",
         help="Output results as markdown (for CI summaries)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Save page HTML to debug_page.html when no results found",
+    )
     args = parser.parse_args()
 
-    results = search_games(args.query, args.console)
+    results = search_games(args.query, args.console, debug=args.debug)
 
     if not results:
         if args.markdown:
