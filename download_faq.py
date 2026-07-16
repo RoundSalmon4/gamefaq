@@ -346,11 +346,14 @@ class FAQDownloader:
         resp.raise_for_status()
 
         data = resp.json()
+        logger.debug("Firecrawl response keys: %s", list(data.keys()))
         if not data.get("success"):
             msg = data.get("error", "unknown error")
             raise FAQDownloadError(f"Firecrawl error: {msg}")
 
-        markdown = data.get("markdown", "")
+        inner = data.get("data", {})
+        logger.debug("Firecrawl inner data keys: %s", list(inner.keys()))
+        markdown = inner.get("markdown", "")
         if not markdown or len(markdown.strip()) < MIN_CONTENT_LENGTH:
             raise FAQDownloadError("Firecrawl returned empty or too-short content.")
 
