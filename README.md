@@ -1,8 +1,8 @@
 # gamefaq
 
-Search and download GameFAQs guides as plain text.
+Search and download GameFAQs guides as markdown.
 
-GameFAQs blocks VPN users and has Cloudflare protections, so this project uses Playwright to bypass those restrictions both locally and in CI.
+GameFAQs blocks VPN users and has Cloudflare protections, so this project uses Firecrawl and ScrapingBee to bypass those restrictions in CI. Search uses Brave Search via Playwright to avoid direct access blocks.
 
 ## Workflow
 
@@ -23,9 +23,11 @@ GameFAQs blocks VPN users and has Cloudflare protections, so this project uses P
 
 1. Go to **Actions** > **Download GameFAQ** > **Run workflow**
 2. Paste a GameFAQ URL from the search results
-3. The guide will be downloaded, committed, and pushed to the `guides/` folder
+3. The guide will be downloaded as `.md`, committed, and pushed to the `guides/` folder
 
 You can use either a direct FAQ URL (with `/faqs/` in the path) or a game page URL — the script will auto-find the top-rated guide.
+
+Requires `FIRECRAWL_API_KEY` and `SCRAPINGBEE_API_KEY` repository secrets.
 
 ## Local Usage
 
@@ -36,10 +38,17 @@ python -m playwright install chromium
 # Search for a game
 python search_faq.py "chrono trigger"
 
-# Download a guide (works with both game page and FAQ URLs)
+# Download a guide (requires API keys)
+export FIRECRAWL_API_KEY="your-key"
 python download_faq.py https://gamefaqs.gamespot.com/ps1/57080-chrono-trigger
 python download_faq.py https://gamefaqs.gamespot.com/ps1/57080-chrono-trigger/faqs/46950
 ```
+
+### Download CLI options
+
+- `--firecrawl KEY` — Firecrawl API key (primary method)
+- `-s` / `--scrapingbee KEY` — ScrapingBee API key (fallback)
+- `-o` / `--output DIR` — output directory (default: `guides/`)
 
 ## Search Filters
 
