@@ -2,8 +2,7 @@
 """
 Download a GameFAQs.com FAQ in plain text format.
 
-Uses Playwright to bypass Cloudflare protections.
-Adapted from https://gist.github.com/alechemy/ed84c5b6b53b5194f1875b96a9a4faf1
+Uses Firecrawl and ScrapingBee to bypass Cloudflare protections.
 
 Usage:
     python download_faq.py <url> [-o output_dir]
@@ -28,7 +27,7 @@ from urllib.parse import parse_qs, quote_plus, urlencode, urlparse, urlunparse
 
 import html2text
 import requests as http_requests
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 logging.basicConfig(
@@ -54,9 +53,6 @@ USER_AGENT = (
 )
 
 NAV_TIMEOUT_MS = 60_000
-SELECTOR_TIMEOUT_MS = 15_000
-CLOUDFLARE_POLL_INTERVAL = 0.5
-CLOUDFLARE_MAX_WAIT = 15
 MAX_RETRIES = 2
 MIN_CONTENT_LENGTH = 100
 
@@ -79,17 +75,6 @@ _JUNK_PATTERNS: list[re.Pattern[str]] = [
         r"security service to protect against",
     )
 ]
-
-_CF_CHALLENGE_INDICATORS = (
-    "text='Verify you are human'",
-    "text='Just a moment'",
-    "text='Performing security verification'",
-    "#challenge-running",
-    "#cf-challenge-running",
-    "#challenge-stage",
-)
-
-_CONTENT_SELECTORS = '[id^="faqspan-"], .faqtext, #content, pre'
 
 
 class FetchResult(NamedTuple):
@@ -143,64 +128,6 @@ def _clean_content(text: str) -> str:
         prev_was_junk = False
         cleaned.append(line)
     return "\n".join(cleaned).rstrip()
-
-
-def _has_cloudflare_challenge(page: Page) -> bool:
-    for selector in _CF_CHALLENGE_INDICATORS:
-        try:
-            if page.locator(selector).count() > 0:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _wait_for_cloudflare(page: Page) -> None:
-    if not _has_cloudflare_challenge(page):
-        return
-    logger.info("Cloudflare challenge detected - waiting for it to clear...")
-    deadline = time.monotonic() + CLOUDFLARE_MAX_WAIT
-    while time.monotonic() < deadline:
-        page.wait_for_timeout(int(CLOUDFLARE_POLL_INTERVAL * 1000))
-        if not _has_cloudflare_challenge(page):
-            logger.info("Cloudflare challenge cleared.")
-            return
-    logger.warning(
-        "Cloudflare challenge did not clear within %d s - proceeding anyway.",
-        CLOUDFLARE_MAX_WAIT,
-    )
-
-
-def _extract_content(page: Page) -> FetchResult | None:
-    spans = page.locator('[id^="faqspan-"]')
-    span_count = spans.count()
-    if span_count > 0:
-        logger.info("Found %d faqspan element(s) - extracting.", span_count)
-        parts: list[str] = []
-        for i in range(span_count):
-            parts.append(spans.nth(i).inner_text())
-        return FetchResult(content="\n".join(parts), is_html=False)
-
-    loc = page.locator(".faqtext").first
-    if loc.count() > 0:
-        is_pre: bool = loc.evaluate("el => el.tagName === 'PRE'")
-        if is_pre:
-            return FetchResult(content=loc.inner_text(), is_html=False)
-        return FetchResult(content=loc.outer_html(), is_html=True)
-
-    pres = page.locator("pre").all()
-    if pres:
-        best = max(pres, key=lambda el: len(el.inner_text()))
-        text = best.inner_text()
-        if len(text.strip()) >= MIN_CONTENT_LENGTH:
-            return FetchResult(content=text, is_html=False)
-
-    full = page.content()
-    if len(full.strip()) >= MIN_CONTENT_LENGTH:
-        logger.info("Using full-page HTML as fallback.")
-        return FetchResult(content=full, is_html=True)
-
-    return None
 
 
 def _resolve_game_url(url: str) -> str:
@@ -327,7 +254,8 @@ def _resolve_game_url(url: str) -> str:
 
 class FAQDownloader:
     def __init__(self, url: str, output_dir: str = ".",
-                 flaresolverr_url: str | None = None) -> None:
+                 scrapingbee_key: str | None = None,
+                 firecrawl_key: str | None = None) -> None:
         base_url = url.split("?")[0]
         if not _validate_url(url):
             raise FAQDownloadError(
@@ -336,7 +264,8 @@ class FAQDownloader:
         self.url = _resolve_game_url(url)
         self.url = _ensure_single_param(self.url)
         self.output_dir = os.path.expanduser(output_dir)
-        self.flaresolverr_url = flaresolverr_url
+        self.scrapingbee_key = scrapingbee_key
+        self.firecrawl_key = firecrawl_key
 
     def fetch_and_save(self) -> str:
         result = self._fetch_with_retries()
@@ -359,11 +288,19 @@ class FAQDownloader:
         last_err: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                if self.flaresolverr_url:
-                    return self._fetch_content_flaresolverr()
-                return self._fetch_content_playwright()
+                if self.firecrawl_key:
+                    return self._fetch_content_firecrawl()
+                if self.scrapingbee_key:
+                    return self._fetch_content_scrapingbee()
+                raise FAQDownloadError(
+                    "No API key provided — set FIRECRAWL_API_KEY or SCRAPINGBEE_API_KEY."
+                )
             except FAQDownloadError as exc:
                 last_err = exc
+                if self.firecrawl_key:
+                    logger.warning("Firecrawl failed, trying ScrapingBee...")
+                    self.firecrawl_key = None
+                    continue
                 if attempt < MAX_RETRIES:
                     wait = 2 ** attempt
                     logger.warning(
@@ -375,187 +312,96 @@ class FAQDownloader:
             f"All {MAX_RETRIES} attempt(s) failed."
         ) from last_err
 
-    def _fetch_content_flaresolverr(self) -> FetchResult:
-        """Fetch via FlareSolverr. Try lightweight cookies-first approach,
-        then fall back to full FlareSolverr HTML response."""
-        api_url = f"{self.flaresolverr_url}/v1"
-        headers = {"Content-Type": "application/json"}
+    def _fetch_content_firecrawl(self) -> FetchResult:
+        """Fetch via Firecrawl API — uses managed infrastructure to bypass
+        Cloudflare and IP-level blocks."""
+        api_url = "https://api.firecrawl.dev/v2/scrape"
+        headers = {
+            "Authorization": f"Bearer {self.firecrawl_key}",
+            "Content-Type": "application/json",
+        }
+        logger.info("Trying Firecrawl for %s", self.url)
 
-        logger.info("Trying FlareSolverr (cookies-first) for %s", self.url)
-
-        # --- Lightweight approach: get cookies, then use requests ---
+        payload = {
+            "url": self.url,
+            "formats": ["markdown"],
+            "onlyMainContent": True,
+            "removeBase64Images": True,
+        }
         try:
-            session_id = f"gfq-{int(time.time())}"
-            # Create a FlareSolverr session
-            create_resp = http_requests.post(
-                api_url, headers=headers,
-                json={"cmd": "sessions.create", "session": session_id},
-                timeout=30,
+            resp = http_requests.post(
+                api_url, headers=headers, json=payload, timeout=120
             )
-            if create_resp.status_code == 200:
-                session_data = create_resp.json()
-                if session_data.get("status") == "ok":
-                    # Get cookies from a request to the game page
-                    base_url = re.sub(r"/faqs/.*$", "", self.url.split("?")[0]).rstrip("/")
-                    cookie_resp = http_requests.post(
-                        api_url, headers=headers,
-                        json={
-                            "cmd": "request.get",
-                            "url": base_url,
-                            "session": session_id,
-                            "maxTimeout": 60000,
-                            "returnOnlyCookies": True,
-                        },
-                        timeout=90,
-                    )
-                    if cookie_resp.status_code == 200:
-                        cookie_data = cookie_resp.json()
-                        if cookie_data.get("status") == "ok":
-                            cookies = {
-                                c["name"]: c["value"]
-                                for c in cookie_data["solution"]["cookies"]
-                            }
-                            user_agent = cookie_data["solution"].get("userAgent", USER_AGENT)
+        except http_requests.RequestException as exc:
+            raise FAQDownloadError(f"Firecrawl request failed: {exc}") from exc
 
-                            # Use requests with the cookies
-                            logger.info("Got %d cookies from FlareSolverr, fetching with requests", len(cookies))
-                            resp = http_requests.get(
-                                self.url, cookies=cookies,
-                                headers={"User-Agent": user_agent},
-                                timeout=30,
-                            )
-                            resp.raise_for_status()
-                            html = resp.text
-                            if len(html) >= MIN_CONTENT_LENGTH and "performing security verification" not in html.lower():
-                                logger.info("Lightweight fetch succeeded (%d bytes)", len(html))
-                                # Cleanup session
-                                try:
-                                    http_requests.post(
-                                        api_url, headers=headers,
-                                        json={"cmd": "sessions.destroy", "session": session_id},
-                                        timeout=10,
-                                    )
-                                except Exception:
-                                    pass
-                                return FetchResult(content=html, is_html=True)
-
-                    logger.info("Lightweight fetch failed, trying full FlareSolverr response")
-                    # Cleanup session before fallback
-                    try:
-                        http_requests.post(
-                            api_url, headers=headers,
-                            json={"cmd": "sessions.destroy", "session": session_id},
-                            timeout=10,
-                        )
-                    except Exception:
-                        pass
-        except Exception as exc:
-            logger.warning("Lightweight FlareSolverr approach failed: %s", exc)
-
-        # --- Full fallback: get HTML directly from FlareSolverr ---
-        logger.info("Trying full FlareSolverr response for %s", self.url)
-        resp = http_requests.post(
-            api_url, headers=headers,
-            json={
-                "cmd": "request.get",
-                "url": self.url,
-                "maxTimeout": 60000,
-            },
-            timeout=90,
-        )
+        if resp.status_code == 402:
+            raise FAQDownloadError(
+                "Firecrawl credits exhausted — check your plan."
+            )
+        if resp.status_code == 429:
+            raise FAQDownloadError(
+                "Firecrawl rate limited — retry later."
+            )
         resp.raise_for_status()
+
         data = resp.json()
-        if data.get("status") != "ok":
+        if not data.get("success"):
+            msg = data.get("error", "unknown error")
+            raise FAQDownloadError(f"Firecrawl error: {msg}")
+
+        markdown = data.get("markdown", "")
+        if not markdown or len(markdown.strip()) < MIN_CONTENT_LENGTH:
+            raise FAQDownloadError("Firecrawl returned empty or too-short content.")
+
+        blocked = "performing security verification" in markdown.lower() or (
+            "request blocked" in markdown.lower()
+            and "abuse from this hosting" in markdown.lower()
+        )
+        if blocked:
             raise FAQDownloadError(
-                f"FlareSolverr returned status: {data.get('status')} — {data.get('message', '')}"
+                "Firecrawl could not bypass Cloudflare for this URL."
             )
-        html = data["solution"]["response"]
+        logger.info("Firecrawl fetch succeeded (%d chars)", len(markdown))
+        return FetchResult(content=markdown, is_html=False)
+
+    def _fetch_content_scrapingbee(self) -> FetchResult:
+        """Fetch via ScrapingBee API — uses residential IPs to bypass
+        Cloudflare and IP-level blocks."""
+        api_url = "https://app.scrapingbee.com/api/v1/"
+        logger.info("Trying ScrapingBee for %s", self.url)
+
+        params = {
+            "api_key": self.scrapingbee_key,
+            "url": self.url,
+            "render_js": "true",
+            "premium_proxy": "true",
+            "stealth_proxy": "true",
+            "return_page_source": "true",
+        }
+        resp = http_requests.get(api_url, params=params, timeout=120)
+        if resp.status_code == 402:
+            raise FAQDownloadError(
+                "ScrapingBee credits exhausted — check your plan."
+            )
+        if resp.status_code == 429:
+            raise FAQDownloadError(
+                "ScrapingBee rate limited — retry later."
+            )
+        resp.raise_for_status()
+        html = resp.text
         if len(html) < MIN_CONTENT_LENGTH:
-            raise FAQDownloadError("FlareSolverr returned empty or too-short content.")
-        if "performing security verification" in html.lower():
+            raise FAQDownloadError("ScrapingBee returned empty or too-short content.")
+        blocked = "performing security verification" in html.lower() or (
+            "request blocked" in html.lower()
+            and "abuse from this hosting" in html.lower()
+        )
+        if blocked:
             raise FAQDownloadError(
-                "Cloudflare blocked the download even via FlareSolverr."
+                "ScrapingBee could not bypass Cloudflare for this URL."
             )
-        logger.info("Full FlareSolverr fetch succeeded (%d bytes)", len(html))
+        logger.info("ScrapingBee fetch succeeded (%d bytes)", len(html))
         return FetchResult(content=html, is_html=True)
-
-    def _fetch_content_playwright(self) -> FetchResult:
-        logger.info("Navigating to %s ...", self.url)
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-web-security",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                ],
-            )
-            try:
-                context = browser.new_context(
-                    user_agent=USER_AGENT,
-                    viewport={"width": 1920, "height": 1080},
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                )
-                context.add_init_script(
-                    """
-                    Object.defineProperty(navigator, 'webdriver',
-                        { get: () => undefined });
-                    Object.defineProperty(navigator, 'plugins',
-                        { get: () => [1, 2, 3, 4, 5] });
-                    Object.defineProperty(navigator, 'languages',
-                        { get: () => ['en-US', 'en'] });
-                    window.chrome = { runtime: {} };
-                    """
-                )
-                page = context.new_page()
-                try:
-                    page.goto(
-                        self.url,
-                        wait_until="domcontentloaded",
-                        timeout=NAV_TIMEOUT_MS,
-                    )
-                except PlaywrightTimeoutError as exc:
-                    raise FAQDownloadError(
-                        f"Navigation timed out after {NAV_TIMEOUT_MS} ms"
-                    ) from exc
-
-                _wait_for_cloudflare(page)
-
-                try:
-                    page.wait_for_selector(
-                        _CONTENT_SELECTORS, timeout=SELECTOR_TIMEOUT_MS
-                    )
-                except PlaywrightTimeoutError:
-                    logger.warning(
-                        "Timed out waiting for content selectors - "
-                        "will attempt extraction anyway."
-                    )
-
-                result = _extract_content(page)
-                if result is None or len(result.content.strip()) < MIN_CONTENT_LENGTH:
-                    raise FAQDownloadError(
-                        "Extracted content was empty or too short."
-                    )
-                # Check if we got a Cloudflare security page instead of FAQ content
-                page_text = result.content.lower()
-                if "performing security verification" in page_text or (
-                    "cloudflare" in page_text
-                    and "faqspan-" not in page_text
-                    and ".faqtext" not in page_text
-                ):
-                    raise FAQDownloadError(
-                        "Cloudflare blocked the download — this typically happens "
-                        "from CI runners. Try downloading locally instead:\n"
-                        f"  python download_faq.py {self.url.split('?')[0]}"
-                    )
-                return result
-            except FAQDownloadError:
-                raise
-            except Exception as exc:
-                raise FAQDownloadError(f"Playwright error: {exc}") from exc
-            finally:
-                browser.close()
 
 
 def main() -> None:
@@ -568,14 +414,18 @@ def main() -> None:
         help="Output directory (default: guides/)",
     )
     parser.add_argument(
-        "-f", "--flaresolverr", default=None, metavar="URL",
-        help="FlareSolverr server URL (e.g. http://localhost:8191) "
-             "to bypass Cloudflare protection",
+        "-s", "--scrapingbee", default=None, metavar="KEY",
+        help="ScrapingBee API key to bypass Cloudflare via residential IPs",
+    )
+    parser.add_argument(
+        "--firecrawl", default=None, metavar="KEY",
+        help="Firecrawl API key to bypass Cloudflare (primary method)",
     )
     args = parser.parse_args()
     try:
         downloader = FAQDownloader(args.url, args.output,
-                                   flaresolverr_url=args.flaresolverr)
+                                   scrapingbee_key=args.scrapingbee,
+                                   firecrawl_key=args.firecrawl)
         filepath = downloader.fetch_and_save()
         print(filepath)
     except FAQDownloadError as exc:
