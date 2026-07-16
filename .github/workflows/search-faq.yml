@@ -1,0 +1,60 @@
+name: Search GameFAQ
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: "Game title to search for"
+        required: true
+        type: string
+      console:
+        description: "Platform filter (e.g. snes, ps1, gba) — leave empty for all"
+        required: false
+        type: string
+      fetch_guides:
+        description: "Fetch FAQ listings for all results"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install chromium
+          python -m playwright install-deps
+
+      - name: Run search
+        id: search
+        run: |
+          CONSOLE_FLAG=""
+          if [ -n "${{ inputs.console }}" ]; then
+            CONSOLE_FLAG="--console ${{ inputs.console }}"
+          fi
+
+          GUIDES_FLAG=""
+          if [ "${{ inputs.fetch_guides }}" = "true" ]; then
+            GUIDES_FLAG="--all-guides"
+          fi
+
+          python search_faq.py "${{ inputs.query }}" $CONSOLE_FLAG $GUIDES_FLAG --markdown > summary.md
+
+      - name: Write job summary
+        run: cat summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Clean up
+        if: always()
+        run: rm -f summary.md

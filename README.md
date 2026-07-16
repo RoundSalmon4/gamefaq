@@ -14,16 +14,15 @@ GameFAQs blocks VPN users and has Cloudflare protections, so this project uses P
 
 ### Search for guides
 
-```bash
-python search_faq.py "final fantasy vii"
-python search_faq.py "zelda" --console snes
-python search_faq.py "pokemon" -g 1     # show FAQs for result #1
-```
+1. Go to **Actions** > **Search GameFAQ** > **Run workflow**
+2. Enter a game title (e.g. `final fantasy vii`)
+3. Optionally set a platform filter (e.g. `ps1`)
+4. The workflow summary will list matching games and their available FAQs with ratings
 
 ### Download a guide
 
 1. Go to **Actions** > **Download GameFAQ** > **Run workflow**
-2. Paste the GameFAQ URL (e.g. `https://gamefaqs.gamespot.com/ps/196853-final-fantasy-vii/faqs/57145`)
+2. Paste the GameFAQ URL from the search results
 3. The guide will be downloaded, committed, and pushed to the `guides/` folder
 
 ## Local Usage
@@ -43,4 +42,6 @@ python download_faq.py <url>
 
 - `--console` / `-c` — filter by platform (snes, ps1, gba, ds, etc.)
 - `-g N` — show FAQ guides for search result #N
+- `-a` / `--all-guides` — fetch FAQ listings for all results
+- `--markdown` — output as markdown (for CI job summaries)
 - `-l` — list results only
