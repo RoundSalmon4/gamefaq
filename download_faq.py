@@ -96,12 +96,12 @@ class FAQDownloadError(Exception):
     pass
 
 
-def _ensure_print_param(url: str) -> str:
+def _ensure_single_param(url: str) -> str:
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
-    if params.get("print") == ["1"]:
+    if params.get("single") == ["1"]:
         return url
-    params["print"] = ["1"]
+    params["single"] = ["1"]
     new_query = urlencode(params, doseq=True)
     return urlunparse(parsed._replace(query=new_query))
 
@@ -324,7 +324,7 @@ class FAQDownloader:
                 f"Invalid URL — expected a GameFAQs FAQ or game page URL. Got: {url}"
             )
         self.url = _resolve_game_url(url)
-        self.url = _ensure_print_param(self.url)
+        self.url = _ensure_single_param(self.url)
         self.output_dir = os.path.expanduser(output_dir)
 
     def fetch_and_save(self) -> str:

@@ -42,7 +42,7 @@ jobs:
         run: |
           git config user.name "roundsalmon4"
           git config user.email "209016228+RoundSalmon4@users.noreply.github.com"
-          git add guides/
+          git add -f guides/
           if git diff --cached --quiet; then
             echo "No new changes to commit."
           else
