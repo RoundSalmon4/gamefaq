@@ -2,3 +2,12 @@ guides/
 __pycache__/
 *.pyc
 .venv/
+debug_page.html
+debug_google_faqs.html
+debug-artifact/
+debug-artifact.zip
+logs/
+logs.zip
+logs2/
+logs2.zip
+summary.md

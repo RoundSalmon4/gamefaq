@@ -146,164 +146,196 @@ def _dump_debug_html(page: Page, path: str = "debug_page.html") -> None:
         logger.debug("Failed to save debug HTML: %s", e)
 
 
-def _wait_for_content(page: Page, timeout_ms: int = 10_000) -> bool:
-    """Wait until the page has meaningful content (not just Cloudflare)."""
-    deadline = time.monotonic() + timeout_ms / 1000
-    while time.monotonic() < deadline:
-        text = page.inner_text("body")
-        if len(text.strip()) > 200 and "verify you are human" not in text.lower():
-            return True
-        page.wait_for_timeout(500)
-    return False
+def _dismiss_google_consent(page: Page) -> None:
+    """Dismiss Google's cookie consent dialog if present."""
+    try:
+        consent_btns = [
+            "button:has-text('Accept all')",
+            "button:has-text('I agree')",
+            "button:has-text('Reject all')",
+            "[aria-label='Accept all']",
+            "[aria-label='Reject all']",
+        ]
+        for sel in consent_btns:
+            btn = page.locator(sel).first
+            if btn.count() > 0:
+                btn.click(timeout=3000)
+                page.wait_for_timeout(1000)
+                return
+    except Exception:
+        pass
 
 
 def search_games(query: str, console_filter: str | None = None,
                  debug: bool = False) -> list[GameResult]:
-    """Search GameFAQs for games matching the query."""
+    """Search for GameFAQs guides via Google (GameFAQs blocks datacenter IPs)."""
     pw, browser, context = _launch_browser()
     try:
         page = context.new_page()
-        url = f"https://gamefaqs.gamespot.com/search?game={quote_plus(query)}"
-        logger.info("Searching: %s", url)
 
-        page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
-        _wait_for_cloudflare(page)
+        # Search Google for GameFAQs results
+        google_query = f"site:gamefaqs.gamespot.com {query}"
+        google_url = f"https://www.google.com/search?q={quote_plus(google_query)}&num=20"
+        logger.info("Searching Google: %s", google_query)
 
-        if not _wait_for_content(page, timeout_ms=15_000):
-            logger.warning("Page did not load content within timeout.")
-            if debug:
-                _dump_debug_html(page)
-            return []
-
+        page.goto(google_url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
+        _dismiss_google_consent(page)
         time.sleep(1)
 
         results: list[GameResult] = []
+        seen_urls: set[str] = set()
 
-        # Try multiple selector strategies
-        selector_strategies = [
-            # Strategy 1: Direct search result items
-            lambda: page.locator(".search_results .result, .result_box").all(),
-            # Strategy 2: sr_ prefixed classes (older GameFAQs layout)
-            lambda: page.locator(".sr_result, .search-result").all(),
-            # Strategy 3: Any element with result-related class
-            lambda: page.locator("[class*='search'] [class*='result'], [class*='search'] [class*='item']").all(),
-            # Strategy 4: Table rows in search results
-            lambda: page.locator("table.results tr, .search-results tr").all(),
-            # Strategy 5: Card-like containers
-            lambda: page.locator(".card, .game-card, .search-card").all(),
-            # Strategy 6: Game links with platform info nearby
-            lambda: page.locator("a[href*='gamefaqs.gamespot.com'][class*='log']").all(),
-        ]
+        # Parse Google search results
+        search_items = page.locator("#search .g, #rso .g").all()
+        if not search_items:
+            search_items = page.locator("[data-sokoban-container]").all()
+        if not search_items:
+            search_items = page.locator(".tF2Cxc, .MjjYud").all()
 
-        for strategy_idx, strategy in enumerate(selector_strategies):
+        logger.info("Found %d Google result containers", len(search_items))
+
+        for item in search_items:
             try:
-                search_items = strategy()
-            except Exception:
-                continue
-
-            if not search_items or len(search_items) < 1:
-                continue
-
-            logger.info("Strategy %d found %d items", strategy_idx + 1, len(search_items))
-
-            for item in search_items:
-                try:
-                    # Try to find the game title link
-                    title_el = item.locator("a.log_search").first
-                    if title_el.count() == 0:
-                        title_el = item.locator(".sr_name a, .result_name a, .title a").first
-                    if title_el.count() == 0:
-                        title_el = item.locator("a[href*='gamefaqs.gamespot.com']").first
-                    if title_el.count() == 0:
-                        continue
-
-                    game_title = title_el.inner_text().strip()
-                    game_url = title_el.get_attribute("href") or ""
-                    if game_url and not game_url.startswith("http"):
-                        game_url = f"https://gamefaqs.gamespot.com{game_url}"
-
-                    if not game_title or len(game_title) < 2:
-                        continue
-
-                    # Try to find the platform
-                    platform = ""
-                    platform_selectors = [
-                        ".platform", ".sr_product_name", ".console",
-                        ".details dt", ".badge", "[class*='platform']",
-                        "[class*='console']",
-                    ]
-                    for ps in platform_selectors:
-                        pel = item.locator(ps).first
-                        if pel.count() > 0:
-                            platform = pel.inner_text().strip()
-                            if platform:
-                                break
-
-                    if not platform:
-                        # Try to extract platform from URL
-                        platform_match = re.search(
-                            r"gamefaqs\.gamespot\.com/([^/]+)/\d+-", game_url
-                        )
-                        if platform_match:
-                            platform = platform_match.group(1).replace("-", " ").title()
-
-                    if console_filter and console_filter.upper() not in platform.upper():
-                        continue
-
-                    # Deduplicate by URL
-                    if not any(r.url == game_url for r in results):
-                        results.append(GameResult(
-                            title=game_title,
-                            platform=platform,
-                            url=game_url,
-                        ))
-                except Exception as e:
-                    logger.debug("Error parsing search result: %s", e)
+                # Find the main link
+                link = item.locator("a[href*='gamefaqs.gamespot.com']").first
+                if link.count() == 0:
                     continue
 
-            if results:
-                break
+                href = link.get_attribute("href") or ""
+                if not href or href in seen_urls:
+                    continue
 
-        # Final fallback: scan all links for game-like URLs
+                # Skip non-game pages
+                if "/faqs/" in href and "/faqs/" == href.split("gamefaqs.gamespot.com")[-1][:6]:
+                    # This is a direct FAQ link - good!
+                    pass
+                elif "/search" in href or "/boards/" in href:
+                    continue
+
+                seen_urls.add(href)
+
+                # Extract snippet text for context
+                snippet = ""
+                snippet_el = item.locator(".VwiC3b, .IsZvec, [data-content-feature]").first
+                if snippet_el.count() > 0:
+                    snippet = snippet_el.inner_text().strip()
+
+                # Parse title from the link or Google result title
+                title = link.inner_text().strip()
+                if not title or len(title) < 2:
+                    title_el = item.locator("h3").first
+                    if title_el.count() > 0:
+                        title = title_el.inner_text().strip()
+
+                if not title:
+                    continue
+
+                # Extract platform from URL
+                platform = ""
+                platform_match = re.search(
+                    r"gamefaqs\.gamespot\.com/([a-z0-9-]+)/(\d+-)", href
+                )
+                if platform_match:
+                    platform = platform_match.group(1).replace("-", " ").title()
+
+                # Clean up Google redirect URLs
+                if href.startswith("/url?"):
+                    actual_url = re.search(r"[?&]q=([^&]+)", href)
+                    if actual_url:
+                        from urllib.parse import unquote
+                        href = unquote(actual_url.group(1))
+
+                if console_filter and console_filter.upper() not in platform.upper():
+                    continue
+
+                # Determine if this is a game page or a direct FAQ link
+                is_faq = "/faqs/" in href and re.search(r"/faqs/\d+", href)
+                game_match = re.search(r"/(\d+-[^/]+?)(?:/faqs)?/?$", href)
+
+                if is_faq:
+                    # Direct FAQ link - extract game info from URL
+                    game_slug = ""
+                    gm = re.search(r"/[a-z0-9-]+/(\d+-[^/]+)/faqs", href)
+                    if gm:
+                        game_slug = gm.group(1)
+                        game_title_raw = re.sub(r"^\d+-", "", game_slug).replace("-", " ").title()
+                    else:
+                        game_title_raw = title
+
+                    results.append(GameResult(
+                        title=f"{game_title_raw} (FAQ: {title})",
+                        platform=platform,
+                        url=href,
+                    ))
+                elif game_match:
+                    # Game page
+                    game_slug = game_match.group(1)
+                    game_title = re.sub(r"^\d+-", "", game_slug).replace("-", " ").title()
+                    if not title or title.lower() in ("gamefaqs", "gamefaqs.com"):
+                        title = game_title
+
+                    results.append(GameResult(
+                        title=title,
+                        platform=platform,
+                        url=href,
+                    ))
+                else:
+                    # Some other GameFAQs link
+                    results.append(GameResult(
+                        title=title,
+                        platform=platform,
+                        url=href,
+                    ))
+
+            except Exception as e:
+                logger.debug("Error parsing Google result: %s", e)
+                continue
+
+        # If no structured results, scan all links
         if not results:
-            logger.info("Trying link-scanning fallback...")
-            all_links = page.locator("a[href*='/']").all()
-            seen_urls: set[str] = set()
+            logger.info("Trying link scan fallback...")
+            all_links = page.locator("a[href*='gamefaqs.gamespot.com']").all()
             for link in all_links:
                 try:
                     href = link.get_attribute("href") or ""
                     text = link.inner_text().strip()
-                    if not text or not href or href in seen_urls:
+                    if not href or not text or href in seen_urls:
                         continue
-                    if "/faqs/" in href or "/search" in href:
+                    if "/search" in href or "/boards/" in href:
                         continue
                     if len(text) < 3:
                         continue
 
-                    # Match game page URLs: /platform/NNNNN-game-name
-                    game_match = re.search(r"/([a-z0-9-]+)/(\d+-[^/]+)", href)
-                    if not game_match:
+                    # Clean Google redirect
+                    if href.startswith("/url?"):
+                        actual = re.search(r"[?&]q=([^&]+)", href)
+                        if actual:
+                            from urllib.parse import unquote
+                            href = unquote(actual.group(1))
+
+                    if "gamefaqs.gamespot.com" not in href:
                         continue
 
                     seen_urls.add(href)
-                    full_url = href if href.startswith("http") else f"https://gamefaqs.gamespot.com{href}"
-                    platform = game_match.group(1).replace("-", " ").title()
+
+                    platform = ""
+                    pm = re.search(r"gamefaqs\.gamespot\.com/([a-z0-9-]+)/\d+", href)
+                    if pm:
+                        platform = pm.group(1).replace("-", " ").title()
 
                     if console_filter and console_filter.upper() not in platform.upper():
                         continue
 
-                    if not any(r.url == full_url for r in results):
-                        results.append(GameResult(
-                            title=text,
-                            platform=platform,
-                            url=full_url,
-                        ))
+                    results.append(GameResult(
+                        title=text,
+                        platform=platform,
+                        url=href,
+                    ))
                 except Exception:
                     continue
 
-        if not results:
-            if debug:
-                _dump_debug_html(page)
+        if not results and debug:
+            _dump_debug_html(page)
 
         return results[:20]
 
@@ -312,9 +344,8 @@ def search_games(query: str, console_filter: str | None = None,
         pw.stop()
 
 
-def get_faqs(game_url: str) -> list[FAQGuide]:
-    """Fetch the FAQ listing for a game page."""
-    faq_url = game_url.rstrip("/") + "/faqs/"
+def _fetch_faqs_direct(faq_url: str) -> list[FAQGuide]:
+    """Try to fetch FAQ listing directly from GameFAQs."""
     pw, browser, context = _launch_browser()
     try:
         page = context.new_page()
@@ -372,7 +403,7 @@ def get_faqs(game_url: str) -> list[FAQGuide]:
 
         if not guides:
             all_links = page.locator("a[href*='/faqs/']").all()
-            seen_urls = set()
+            seen_urls: set[str] = set()
             for link in all_links:
                 try:
                     href = link.get_attribute("href") or ""
@@ -392,12 +423,145 @@ def get_faqs(game_url: str) -> list[FAQGuide]:
                 except Exception:
                     continue
 
+        # Check if we got blocked
+        page_text = page.inner_text("body")
+        if "Request Blocked" in page_text or "abuse from this hosting" in page_text:
+            logger.warning("GameFAQs blocked direct access (datacenter IP detected)")
+            return []
+
         guides.sort(key=lambda g: g.rating_rank)
         return guides
 
     finally:
         browser.close()
         pw.stop()
+
+
+def _search_faqs_via_google(game_title: str, platform: str = "",
+                            debug: bool = False) -> list[FAQGuide]:
+    """Search Google for GameFAQs FAQ pages for a specific game."""
+    pw, browser, context = _launch_browser()
+    try:
+        page = context.new_page()
+
+        # Build a targeted search for FAQ pages
+        site_part = "site:gamefaqs.gamespot.com/faqs/"
+        query = f"{site_part} {game_title}"
+        if platform:
+            platform_slug = platform.lower().replace(" ", "-")
+            query += f" {platform_slug}"
+
+        google_url = f"https://www.google.com/search?q={quote_plus(query)}&num=10"
+        logger.info("Searching Google for FAQs: %s", query)
+
+        page.goto(google_url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
+        _dismiss_google_consent(page)
+        time.sleep(1)
+
+        guides: list[FAQGuide] = []
+        seen_urls: set[str] = set()
+
+        # Parse Google results
+        search_items = page.locator("#search .g, #rso .g").all()
+        if not search_items:
+            search_items = page.locator(".tF2Cxc, .MjjYud").all()
+
+        for item in search_items:
+            try:
+                link = item.locator("a[href*='gamefaqs.gamespot.com/faqs/']").first
+                if link.count() == 0:
+                    continue
+
+                href = link.get_attribute("href") or ""
+                if not href or href in seen_urls:
+                    continue
+
+                # Clean Google redirect
+                if href.startswith("/url?"):
+                    actual = re.search(r"[?&]q=([^&]+)", href)
+                    if actual:
+                        from urllib.parse import unquote
+                        href = unquote(actual.group(1))
+
+                if "gamefaqs.gamespot.com/faqs/" not in href:
+                    continue
+
+                # Must be a direct FAQ page (has a numeric ID)
+                if not re.search(r"/faqs/\d+", href):
+                    continue
+
+                seen_urls.add(href)
+
+                # Get title from Google result
+                title = link.inner_text().strip()
+                if not title:
+                    h3 = item.locator("h3").first
+                    if h3.count() > 0:
+                        title = h3.inner_text().strip()
+
+                if not title:
+                    continue
+
+                # Try to extract snippet for rating info
+                snippet = ""
+                snippet_el = item.locator(".VwiC3b, .IsZvec").first
+                if snippet_el.count() > 0:
+                    snippet = snippet_el.inner_text().strip().lower()
+
+                # Infer rating from snippet keywords
+                rating = "Unrated"
+                if "highest rated" in snippet or "top rated" in snippet:
+                    rating = "Highest Rated"
+                elif "most recommended" in snippet:
+                    rating = "Most Recommended"
+                elif "complete" in snippet:
+                    rating = "Complete"
+                elif "detailed" in snippet or "full" in snippet:
+                    rating = "Complete"
+
+                if not href.startswith("http"):
+                    href = f"https://gamefaqs.gamespot.com{href}"
+
+                guides.append(FAQGuide(
+                    title=title,
+                    url=href,
+                    rating=rating,
+                    rating_rank=RATING_ORDER.get(rating, 5),
+                ))
+            except Exception as e:
+                logger.debug("Error parsing Google FAQ result: %s", e)
+                continue
+
+        if not guides and debug:
+            _dump_debug_html(page, path="debug_google_faqs.html")
+
+        guides.sort(key=lambda g: g.rating_rank)
+        return guides
+
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def get_faqs(game_url: str, game_title: str = "",
+             platform: str = "", debug: bool = False) -> list[FAQGuide]:
+    """Fetch the FAQ listing for a game. Falls back to Google if GameFAQs blocks direct access."""
+    faq_url = game_url.rstrip("/") + "/faqs/"
+
+    # Try direct access first
+    guides = _fetch_faqs_direct(faq_url)
+    if guides:
+        return guides
+
+    # Direct access failed — fall back to Google search
+    logger.info("Direct access blocked, trying Google search for FAQs...")
+    if not game_title:
+        # Extract title from URL
+        gm = re.search(r"/\d+-([^/]+)", game_url)
+        if gm:
+            game_title = gm.group(1).replace("-", " ").title()
+
+    return _search_faqs_via_google(game_title, platform, debug)
 
 
 def format_markdown(query: str, console_filter: str | None,
@@ -503,12 +667,17 @@ def main() -> None:
             if not args.markdown:
                 print(f"\nInvalid selection. Choose 1-{len(results)}.")
             sys.exit(1)
-        guides_map[args.guides] = get_faqs(results[idx].url)
+        game = results[idx]
+        guides_map[args.guides] = get_faqs(
+            game.url, game.title, game.platform, args.debug
+        )
 
     if args.all_guides:
         for i, game in enumerate(results, 1):
             logger.info("Fetching guides for [%d] %s...", i, game.title)
-            guides_map[i] = get_faqs(game.url)
+            guides_map[i] = get_faqs(
+                game.url, game.title, game.platform, args.debug
+            )
 
     if args.markdown:
         print(format_markdown(args.query, args.console, results,
