@@ -217,14 +217,17 @@ def search_games(query: str, console_filter: str | None = None,
     try:
         page = context.new_page()
 
-        brave_query = f"site:gamefaqs.gamespot.com {query}"
+        brave_query = f"site:gamefaqs.gamespot.com \"{query}\""
         _search_brave(page, brave_query)
 
         results: list[GameResult] = []
         seen_urls: set[str] = set()
 
-        # Find all GameFAQs links on the page
-        all_links = page.locator("a[href*='gamefaqs.gamespot.com']").all()
+        # Only collect links inside Brave's actual search result containers
+        result_container = page.locator("#results, .snippet, [class*='result']")
+        all_links = result_container.locator("a[href*='gamefaqs.gamespot.com']").all()
+        if not all_links:
+            all_links = page.locator("a[href*='gamefaqs.gamespot.com']").all()
         logger.info("Found %d links to gamefaqs.gamespot.com", len(all_links))
 
         for link_el in all_links:
@@ -315,10 +318,13 @@ def search_games(query: str, console_filter: str | None = None,
         if not results:
             logger.info("Brave returned no results, trying Startpage...")
             try:
-                brave_query = f"site:gamefaqs.gamespot.com {query}"
+                brave_query = f"site:gamefaqs.gamespot.com \"{query}\""
                 _search_startpage(page, brave_query)
 
-                all_links = page.locator("a[href*='gamefaqs.gamespot.com']").all()
+                result_container = page.locator(".w-gl__result, .result, [class*='result']")
+                all_links = result_container.locator("a[href*='gamefaqs.gamespot.com']").all()
+                if not all_links:
+                    all_links = page.locator("a[href*='gamefaqs.gamespot.com']").all()
                 logger.info("Found %d links via Startpage fallback", len(all_links))
 
                 for link_el in all_links:
