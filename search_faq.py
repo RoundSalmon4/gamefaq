@@ -83,6 +83,7 @@ class GameResult:
     platform: str
     url: str
     guides: list[FAQGuide] = field(default_factory=list)
+    _relevance: float = field(default=0.0, repr=False, compare=False)
 
     def __str__(self) -> str:
         return f"{self.title} ({self.platform})\n  {self.url}"
@@ -217,94 +218,105 @@ def search_games(query: str, console_filter: str | None = None,
     try:
         page = context.new_page()
 
-        brave_query = f"site:gamefaqs.gamespot.com \"{query}\""
+        query_words = set(query.lower().split())
+
+        # Search with quoted title and also try the URL-slugified version
+        slug_query = query.lower().replace(" ", "-")
+        brave_query = (
+            f"site:gamefaqs.gamespot.com \"{query}\" "
+            f"-faqs -boards -news -community -qna -answers"
+        )
+        slug_brave_query = (
+            f"site:gamefaqs.gamespot.com {slug_query} "
+            f"-faqs -boards -news -community -qna -answers"
+        )
         _search_brave(page, brave_query)
 
         results: list[GameResult] = []
         seen_urls: set[str] = set()
 
-        # Only collect links inside Brave's actual search result containers
-        result_container = page.locator("#results, .snippet, [class*='result']")
-        all_links = result_container.locator("a[href*='gamefaqs.gamespot.com']").all()
-        if not all_links:
-            all_links = page.locator("a[href*='gamefaqs.gamespot.com']").all()
-        logger.info("Found %d links to gamefaqs.gamespot.com", len(all_links))
+        # Try slug-based search if initial search found nothing relevant
+        def _collect_results() -> None:
+            nonlocal results, seen_urls
+            result_container = page.locator("#results, .snippet, [class*='result']")
+            links = result_container.locator("a[href*='gamefaqs.gamespot.com']").all()
+            if not links:
+                links = page.locator("a[href*='gamefaqs.gamespot.com']").all()
+            logger.info("Found %d links to gamefaqs.gamespot.com", len(links))
 
-        for link_el in all_links:
-            try:
-                href = link_el.get_attribute("href") or ""
-                if not href or href in seen_urls:
-                    continue
+            for link_el in links:
+                try:
+                    href = link_el.get_attribute("href") or ""
+                    if not href or href in seen_urls:
+                        continue
+                    if any(skip in href for skip in ("/boards/", "/search", "/topic/", "/community/")):
+                        continue
+                    seen_urls.add(href)
+                    platform, slug = _parse_gamefaqs_url(href)
+                    if not slug:
+                        continue
+                    slug_title = re.sub(r"^\d+-", "", slug).replace("-", " ").title()
+                    title = _clean_title(link_el.inner_text())
+                    if not title or len(title) < 3 or title.lower() in ("gamefaqs", "gamefaqs.com"):
+                        title = slug_title
+                    if console_filter and console_filter.upper() not in platform.upper():
+                        continue
 
-                # Skip boards, search, and other non-game pages
-                if any(skip in href for skip in ("/boards/", "/search", "/topic/")):
-                    continue
+                    # Compute relevance score: fraction of query words in title/slug
+                    title_words = set(title.lower().split()) | set(slug_title.lower().split())
+                    overlap = len(query_words & title_words)
+                    relevance = overlap / len(query_words) if query_words else 0
 
-                seen_urls.add(href)
-
-                # Extract platform from URL
-                platform, slug = _parse_gamefaqs_url(href)
-                if not slug:
-                    continue
-
-                # Derive a readable title from the slug
-                slug_title = re.sub(r"^\d+-", "", slug).replace("-", " ").title()
-
-                # Try to get the link text as the display title
-                title = _clean_title(link_el.inner_text())
-                if not title or len(title) < 3 or title.lower() in ("gamefaqs", "gamefaqs.com"):
-                    title = slug_title
-
-                # Skip if platform filter doesn't match
-                if console_filter and console_filter.upper() not in platform.upper():
-                    continue
-
-                if _is_gamefaqs_faq_page(href):
-                    # Extract the base game URL from this FAQ sub-page
-                    game_base = re.sub(r'/faqs/.*$', '', href).rstrip("/")
-                    faq_title = title
-                    faq_url = href if href.startswith("http") else f"https://gamefaqs.gamespot.com{href}"
-                    if game_base not in seen_urls:
-                        # First time seeing this game — add it as a game result
-                        results.append(GameResult(
-                            title=slug_title,
-                            platform=platform,
-                            url=game_base,
-                            guides=[FAQGuide(title=faq_title, url=faq_url)],
-                        ))
-                        seen_urls.add(game_base)
+                    if _is_gamefaqs_faq_page(href):
+                        game_base = re.sub(r'/faqs/.*$', '', href).rstrip("/")
+                        faq_title = title
+                        faq_url = href if href.startswith("http") else f"https://gamefaqs.gamespot.com{href}"
+                        if game_base not in seen_urls:
+                            results.append(GameResult(
+                                title=slug_title,
+                                platform=platform,
+                                url=game_base,
+                                guides=[FAQGuide(title=faq_title, url=faq_url)],
+                                _relevance=relevance,
+                            ))
+                            seen_urls.add(game_base)
+                        else:
+                            for r in results:
+                                if r.url == game_base:
+                                    r.guides.append(FAQGuide(title=faq_title, url=faq_url))
+                                    break
+                    elif _is_gamefaqs_game_page(href):
+                        if href not in seen_urls:
+                            results.append(GameResult(
+                                title=title, platform=platform, url=href, _relevance=relevance,
+                            ))
+                            seen_urls.add(href)
                     else:
-                        # Already have this game — append this FAQ as a pre-discovered guide
-                        for r in results:
-                            if r.url == game_base:
-                                r.guides.append(FAQGuide(title=faq_title, url=faq_url))
-                                break
-                elif _is_gamefaqs_game_page(href):
-                    if href not in seen_urls:
-                        results.append(GameResult(
-                            title=title,
-                            platform=platform,
-                            url=href,
-                        ))
-                        seen_urls.add(href)
-                else:
-                    # Some other gamefaqs page (FAQ listing, etc.)
-                    if href not in seen_urls:
-                        results.append(GameResult(
-                            title=title,
-                            platform=platform,
-                            url=href,
-                        ))
-                        seen_urls.add(href)
+                        if href not in seen_urls:
+                            results.append(GameResult(
+                                title=title, platform=platform, url=href, _relevance=relevance,
+                            ))
+                            seen_urls.add(href)
+                except Exception as e:
+                    logger.debug("Error parsing link: %s", e)
+                    continue
 
-            except Exception as e:
-                logger.debug("Error parsing link: %s", e)
-                continue
+        _collect_results()
 
-        # Deduplicate by game base URL (keep first occurrence)
+        # If nothing relevant found, try slug-based search
+        if not results or all(r._relevance < 0.3 for r in results):
+            logger.info("Weak results, trying URL-slug search: %s", slug_query)
+            _search_brave(page, slug_brave_query)
+            _collect_results()
+
+        # Filter to relevant results and sort by relevance
+        relevant = [r for r in results if r._relevance >= 0.3 or len(results) <= 2]
+        relevant.sort(key=lambda r: (-r._relevance, r.title))
+
+        # Deduplicate by game base URL
         unique: list[GameResult] = []
         deduped_bases: set[str] = set()
-        for r in results:
+        for r in relevant:
             base = re.sub(r'/faqs/.*$', '', r.url).rstrip("/")
             if base not in deduped_bases:
                 deduped_bases.add(base)
@@ -318,7 +330,7 @@ def search_games(query: str, console_filter: str | None = None,
         if not results:
             logger.info("Brave returned no results, trying Startpage...")
             try:
-                brave_query = f"site:gamefaqs.gamespot.com \"{query}\""
+                brave_query = f"site:gamefaqs.gamespot.com \"{query}\" -faqs -boards -news"
                 _search_startpage(page, brave_query)
 
                 result_container = page.locator(".w-gl__result, .result, [class*='result']")
@@ -344,6 +356,9 @@ def search_games(query: str, console_filter: str | None = None,
                             title = slug_title
                         if console_filter and console_filter.upper() not in platform.upper():
                             continue
+                        title_words = set(title.lower().split()) | set(slug_title.lower().split())
+                        overlap = len(query_words & title_words)
+                        relevance = overlap / len(query_words) if query_words else 0
                         # Collapse FAQ sub-pages to their game base URL
                         if _is_gamefaqs_faq_page(href):
                             game_base = re.sub(r'/faqs/.*$', '', href).rstrip("/")
@@ -353,6 +368,7 @@ def search_games(query: str, console_filter: str | None = None,
                                 results.append(GameResult(
                                     title=slug_title, platform=platform, url=game_base,
                                     guides=[FAQGuide(title=title, url=faq_url)],
+                                    _relevance=relevance,
                                 ))
                             else:
                                 for r in results:
@@ -360,16 +376,19 @@ def search_games(query: str, console_filter: str | None = None,
                                         r.guides.append(FAQGuide(title=title, url=faq_url))
                                         break
                         else:
-                            results.append(GameResult(title=title, platform=platform, url=href))
+                            results.append(GameResult(title=title, platform=platform,
+                                                      url=href, _relevance=relevance))
                     except Exception:
                         continue
 
                 if results:
                     logger.info("Startpage fallback found %d results", len(results))
+                    relevant = [r for r in results if r._relevance >= 0.3]
+                    relevant.sort(key=lambda r: (-r._relevance, r.title))
                     # Deduplicate by game base URL
                     unique2: list[GameResult] = []
                     seen_bases2: set[str] = set()
-                    for r in results:
+                    for r in relevant:
                         base = re.sub(r'/faqs/.*$', '', r.url).rstrip("/")
                         if base not in seen_bases2:
                             seen_bases2.add(base)
