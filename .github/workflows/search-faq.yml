@@ -16,6 +16,11 @@ on:
         required: false
         type: boolean
         default: true
+      min_relevance:
+        description: "Minimum relevance threshold (0.0-1.0, default 0.3)"
+        required: false
+        type: string
+        default: "0.3"
 
 jobs:
   search:
@@ -50,7 +55,7 @@ jobs:
             GUIDES_FLAG="--all-guides"
           fi
 
-          python search_faq.py "${{ inputs.query }}" $CONSOLE_FLAG $GUIDES_FLAG --markdown --debug > summary.md || true
+          python search_faq.py "${{ inputs.query }}" $CONSOLE_FLAG $GUIDES_FLAG --markdown --debug --min-relevance ${{ inputs.min_relevance }} > summary.md || true
 
       - name: Upload debug HTML
         if: always()

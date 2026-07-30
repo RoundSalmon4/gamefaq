@@ -213,7 +213,8 @@ def _search_brave(page: Page, query: str) -> None:
 
 
 def search_games(query: str, console_filter: str | None = None,
-                 debug: bool = False) -> list[GameResult]:
+                 debug: bool = False,
+                 min_relevance: float = 0.3) -> list[GameResult]:
     """Search for GameFAQs guides via Brave Search (GameFAQs + Google both block datacenter IPs)."""
     pw, browser, context = _launch_browser()
     try:
@@ -305,13 +306,13 @@ def search_games(query: str, console_filter: str | None = None,
         _collect_results()
 
         # If nothing relevant found, try slug-based search
-        if not results or all(r._relevance < 0.3 for r in results):
+        if not results or all(r._relevance < min_relevance for r in results):
             logger.info("Weak results, trying URL-slug search: %s", slug_query)
             _search_brave(page, slug_brave_query)
             _collect_results()
 
         # Filter to relevant results and sort by relevance
-        relevant = [r for r in results if r._relevance >= 0.3 or len(results) <= 2]
+        relevant = [r for r in results if r._relevance >= min_relevance or len(results) <= 2]
         relevant.sort(key=lambda r: (-r._relevance, r.title))
 
         # Deduplicate by game base URL
@@ -381,7 +382,7 @@ def search_games(query: str, console_filter: str | None = None,
 
                 if results:
                     logger.info("Startpage fallback found %d results", len(results))
-                    relevant = [r for r in results if r._relevance >= 0.3]
+                    relevant = [r for r in results if r._relevance >= min_relevance]
                     relevant.sort(key=lambda r: (-r._relevance, r.title))
                     # Deduplicate by game base URL
                     unique2: list[GameResult] = []
@@ -794,9 +795,14 @@ def main() -> None:
         action="store_true",
         help="Save page HTML to debug_page.html when no results found",
     )
+    parser.add_argument(
+        "--min-relevance", type=float, default=0.3, metavar="FLOAT",
+        help="Minimum relevance threshold (0.0-1.0, default 0.3)",
+    )
     args = parser.parse_args()
 
-    results = search_games(args.query, args.console, debug=args.debug)
+    results = search_games(args.query, args.console, debug=args.debug,
+                           min_relevance=args.min_relevance)
 
     if not results:
         if args.markdown:
