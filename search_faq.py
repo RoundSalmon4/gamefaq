@@ -86,7 +86,8 @@ class GameResult:
     _relevance: float = field(default=0.0, repr=False, compare=False)
 
     def __str__(self) -> str:
-        return f"{self.title} ({self.platform})\n  {self.url}"
+        score = f" [rel: {self._relevance:.0%}]" if self._relevance else ""
+        return f"{self.title}{score} ({self.platform})\n  {self.url}"
 
 
 def _has_cloudflare_challenge(page: Page) -> bool:
@@ -255,21 +256,21 @@ def search_games(query: str, console_filter: str | None = None,
                     platform, slug = _parse_gamefaqs_url(href)
                     if not slug:
                         continue
+                    # Always derive game title from the URL slug, not link text
                     slug_title = re.sub(r"^\d+-", "", slug).replace("-", " ").title()
-                    title = _clean_title(link_el.inner_text())
-                    if not title or len(title) < 3 or title.lower() in ("gamefaqs", "gamefaqs.com"):
-                        title = slug_title
-                    if console_filter and console_filter.upper() not in platform.upper():
-                        continue
 
-                    # Compute relevance score: fraction of query words in title/slug
-                    title_words = set(title.lower().split()) | set(slug_title.lower().split())
+                    # Compute relevance based on slug title only (link text can contain 
+                    # chapter/section names unrelated to the actual game)
+                    title_words = set(slug_title.lower().split())
                     overlap = len(query_words & title_words)
                     relevance = overlap / len(query_words) if query_words else 0
 
+                    if console_filter and console_filter.upper() not in platform.upper():
+                        continue
+
                     if _is_gamefaqs_faq_page(href):
                         game_base = re.sub(r'/faqs/.*$', '', href).rstrip("/")
-                        faq_title = title
+                        faq_title = slug_title
                         faq_url = href if href.startswith("http") else f"https://gamefaqs.gamespot.com{href}"
                         if game_base not in seen_urls:
                             results.append(GameResult(
@@ -288,13 +289,13 @@ def search_games(query: str, console_filter: str | None = None,
                     elif _is_gamefaqs_game_page(href):
                         if href not in seen_urls:
                             results.append(GameResult(
-                                title=title, platform=platform, url=href, _relevance=relevance,
+                                title=slug_title, platform=platform, url=href, _relevance=relevance,
                             ))
                             seen_urls.add(href)
                     else:
                         if href not in seen_urls:
                             results.append(GameResult(
-                                title=title, platform=platform, url=href, _relevance=relevance,
+                                title=slug_title, platform=platform, url=href, _relevance=relevance,
                             ))
                             seen_urls.add(href)
                 except Exception as e:
@@ -351,12 +352,9 @@ def search_games(query: str, console_filter: str | None = None,
                         if not slug:
                             continue
                         slug_title = re.sub(r"^\d+-", "", slug).replace("-", " ").title()
-                        title = _clean_title(link_el.inner_text())
-                        if not title or len(title) < 3 or title.lower() in ("gamefaqs", "gamefaqs.com"):
-                            title = slug_title
                         if console_filter and console_filter.upper() not in platform.upper():
                             continue
-                        title_words = set(title.lower().split()) | set(slug_title.lower().split())
+                        title_words = set(slug_title.lower().split())
                         overlap = len(query_words & title_words)
                         relevance = overlap / len(query_words) if query_words else 0
                         # Collapse FAQ sub-pages to their game base URL
@@ -367,16 +365,16 @@ def search_games(query: str, console_filter: str | None = None,
                                 seen_urls.add(game_base)
                                 results.append(GameResult(
                                     title=slug_title, platform=platform, url=game_base,
-                                    guides=[FAQGuide(title=title, url=faq_url)],
+                                    guides=[FAQGuide(title=slug_title, url=faq_url)],
                                     _relevance=relevance,
                                 ))
                             else:
                                 for r in results:
                                     if r.url == game_base:
-                                        r.guides.append(FAQGuide(title=title, url=faq_url))
+                                        r.guides.append(FAQGuide(title=slug_title, url=faq_url))
                                         break
                         else:
-                            results.append(GameResult(title=title, platform=platform,
+                            results.append(GameResult(title=slug_title, platform=platform,
                                                       url=href, _relevance=relevance))
                     except Exception:
                         continue
@@ -722,7 +720,8 @@ def format_markdown(query: str, console_filter: str | None,
     lines.append("")
 
     for i, game in enumerate(results, 1):
-        lines.append(f"## [{i}] {game.title}")
+        rel_tag = f" (rel: {game._relevance:.0%})" if game._relevance else ""
+        lines.append(f"## [{i}] {game.title}{rel_tag}")
         lines.append(f"**Platform:** {game.platform}  ")
         lines.append(f"**Game page:** {game.url}")
         lines.append("")
