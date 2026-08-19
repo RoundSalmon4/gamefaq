@@ -37,10 +37,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          python -m playwright install chromium
-          python -m playwright install-deps
+        run: pip install -r requirements.txt
 
       - name: Run search
         id: search
