@@ -28,7 +28,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Download FAQ
-        run: python download_faq.py "${{ inputs.faq_url }}" -o guides --firecrawl "${{ secrets.FIRECRAWL_API_KEY }}" --scrapingbee "${{ secrets.SCRAPINGBEE_API_KEY }}" --commit-title commit_title.txt
+        run: python download_faq.py "${{ inputs.faq_url }}" -o guides --firecrawl "${{ secrets.FIRECRAWL_API_KEY }}" --commit-title commit_title.txt
 
       - name: Commit and push
         run: |

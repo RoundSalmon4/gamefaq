@@ -2,7 +2,7 @@
 
 Search and download GameFAQs guides as markdown.
 
-GameFAQs blocks VPN users and has Cloudflare protections, so this project uses Firecrawl and ScrapingBee to bypass those restrictions in CI. Both search and downloads go through Firecrawl's hosted infrastructure, which works from any network without being IP-blocked.
+GameFAQs blocks VPN users and has Cloudflare protections, so this project uses Firecrawl to bypass those restrictions in CI. Both search and downloads go through Firecrawl's hosted infrastructure, which works from any network without being IP-blocked.
 
 ## Workflow
 
@@ -27,7 +27,7 @@ GameFAQs blocks VPN users and has Cloudflare protections, so this project uses F
 
 You can use either a direct FAQ URL (with `/faqs/` in the path) or a game page URL — the script will auto-find the top-rated guide.
 
-Requires `FIRECRAWL_API_KEY` and `SCRAPINGBEE_API_KEY` repository secrets.
+Requires a `FIRECRAWL_API_KEY` repository secret.
 
 ## Local Usage
 
@@ -46,8 +46,7 @@ python download_faq.py https://gamefaqs.gamespot.com/ps1/57080-chrono-trigger/fa
 
 ### Download CLI options
 
-- `--firecrawl KEY` — Firecrawl API key (primary method)
-- `-s` / `--scrapingbee KEY` — ScrapingBee API key (fallback)
+- `--firecrawl KEY` — Firecrawl API key
 - `-o` / `--output DIR` — output directory (default: `guides/`)
 - `--commit-title FILE` — write a commit title (e.g. `Add <game> guide`) to FILE
 

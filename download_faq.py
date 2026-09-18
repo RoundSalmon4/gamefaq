@@ -2,7 +2,7 @@
 """
 Download a GameFAQs.com FAQ in plain text format.
 
-Uses Firecrawl and ScrapingBee to bypass Cloudflare protections.
+Uses Firecrawl to bypass Cloudflare protections.
 
 Usage:
     python download_faq.py <url> [-o output_dir]
@@ -25,7 +25,6 @@ import time
 from typing import NamedTuple
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-import html2text
 import requests as http_requests
 
 from search_faq import FAQGuide, _extract_faq_links, _firecrawl_scrape
@@ -199,7 +198,6 @@ def _rewrite_chapter_links(markdown: str) -> str:
 
 class FetchResult(NamedTuple):
     content: str
-    is_html: bool
 
 
 class FAQDownloadError(Exception):
@@ -232,33 +230,12 @@ def _generate_filename(url: str) -> str:
     return "gamefaqs_download.md"
 
 
-def _scrapingbee_html(url: str, key: str) -> str:
-    """Fetch a page via the ScrapingBee API (residential IPs)."""
-    api_url = "https://app.scrapingbee.com/api/v1/"
-    params = {
-        "api_key": key,
-        "url": url,
-        "render_js": "true",
-        "premium_proxy": "true",
-        "stealth_proxy": "true",
-        "return_page_source": "true",
-    }
-    resp = http_requests.get(api_url, params=params, timeout=120)
-    if resp.status_code == 402:
-        raise FAQDownloadError("ScrapingBee credits exhausted — check your plan.")
-    if resp.status_code == 429:
-        raise FAQDownloadError("ScrapingBee rate limited — retry later.")
-    resp.raise_for_status()
-    return resp.text
-
-
-def _resolve_game_url(url: str, firecrawl_key: str | None = None,
-                      scrapingbee_key: str | None = None) -> str:
+def _resolve_game_url(url: str, firecrawl_key: str | None = None) -> str:
     """Given a game page URL, find the best FAQ URL and return it.
 
-    Scrapes the game's FAQ listing page via Firecrawl (or ScrapingBee) to
-    avoid direct access blocks from datacenter IPs, then picks the
-    highest-rated guide. Returns the original URL if it's already a FAQ URL.
+    Scrapes the game's FAQ listing page via Firecrawl to avoid direct
+    access blocks from datacenter IPs, then picks the highest-rated guide.
+    Returns the original URL if it's already a FAQ URL.
     """
     base_url = url.split("?")[0]
     if RE_FAQ_URL.match(base_url):
@@ -281,22 +258,10 @@ def _resolve_game_url(url: str, firecrawl_key: str | None = None,
             guides = _extract_faq_links(inner, listing_url)
         except (RuntimeError, http_requests.RequestException, FAQDownloadError) as exc:
             logger.warning("Firecrawl listing lookup failed: %s", exc)
-    elif scrapingbee_key:
-        try:
-            html = _scrapingbee_html(listing_url, scrapingbee_key)
-            seen: set[str] = set()
-            for h in re.findall(r'href="([^"]*/faqs/\d+[^"]*)"', html):
-                h = re.sub(r"(/faqs/\d+).*", r"\1", h)
-                if not h.startswith("http"):
-                    h = f"https://gamefaqs.gamespot.com{h}"
-                if h in seen:
-                    continue
-                seen.add(h)
-                slug_m = re.search(r"/faqs/\d+-([^/?]+)", h)
-                title = slug_m.group(1).replace("-", " ").title() if slug_m else "FAQ"
-                guides.append(FAQGuide(title=title, url=h))
-        except FAQDownloadError as exc:
-            logger.warning("ScrapingBee listing lookup failed: %s", exc)
+    else:
+        raise FAQDownloadError(
+            "No Firecrawl API key - set FIRECRAWL_API_KEY or pass --firecrawl KEY."
+        )
 
     if not guides:
         raise FAQDownloadError(
@@ -313,16 +278,14 @@ def _resolve_game_url(url: str, firecrawl_key: str | None = None,
 
 class FAQDownloader:
     def __init__(self, url: str, output_dir: str = ".",
-                 scrapingbee_key: str | None = None,
                  firecrawl_key: str | None = None) -> None:
         base_url = url.split("?")[0]
         if not _validate_url(url):
             raise FAQDownloadError(
                 f"Invalid URL — expected a GameFAQs FAQ or game page URL. Got: {url}"
             )
-        self.scrapingbee_key = scrapingbee_key
         self.firecrawl_key = firecrawl_key
-        self.url = _resolve_game_url(base_url, firecrawl_key, scrapingbee_key)
+        self.url = _resolve_game_url(base_url, firecrawl_key)
         self.url = _ensure_single_param(self.url)
         self.output_dir = os.path.expanduser(output_dir)
 
@@ -334,13 +297,7 @@ class FAQDownloader:
 
     def fetch_and_save(self, commit_title_path: str | None = None) -> str:
         result = self._fetch_with_retries()
-        if result.is_html:
-            h = html2text.HTML2Text()
-            h.body_width = 0
-            text = h.handle(result.content)
-        else:
-            text = result.content
-        text = _clean_content(text)
+        text = _clean_content(result.content)
         text = _rewrite_chapter_links(text)
         filename = _generate_filename(self.url)
         filepath = os.path.join(self.output_dir, filename)
@@ -355,22 +312,16 @@ class FAQDownloader:
         return filepath
 
     def _fetch_with_retries(self) -> FetchResult:
+        if not self.firecrawl_key:
+            raise FAQDownloadError(
+                "No Firecrawl API key - set FIRECRAWL_API_KEY or pass --firecrawl KEY."
+            )
         last_err: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                if self.firecrawl_key:
-                    return self._fetch_content_firecrawl()
-                if self.scrapingbee_key:
-                    return self._fetch_content_scrapingbee()
-                raise FAQDownloadError(
-                    "No API key provided — set FIRECRAWL_API_KEY or SCRAPINGBEE_API_KEY."
-                )
+                return self._fetch_content_firecrawl()
             except FAQDownloadError as exc:
                 last_err = exc
-                if self.firecrawl_key:
-                    logger.warning("Firecrawl failed, trying ScrapingBee...")
-                    self.firecrawl_key = None
-                    continue
                 if attempt < MAX_RETRIES:
                     wait = 2 ** attempt
                     logger.warning(
@@ -436,25 +387,7 @@ class FAQDownloader:
                 "Firecrawl could not bypass Cloudflare for this URL."
             )
         logger.info("Firecrawl fetch succeeded (%d chars)", len(markdown))
-        return FetchResult(content=markdown, is_html=False)
-
-    def _fetch_content_scrapingbee(self) -> FetchResult:
-        """Fetch via ScrapingBee API — uses residential IPs to bypass
-        Cloudflare and IP-level blocks."""
-        logger.info("Trying ScrapingBee for %s", self.url)
-        html = _scrapingbee_html(self.url, self.scrapingbee_key)
-        if len(html) < MIN_CONTENT_LENGTH:
-            raise FAQDownloadError("ScrapingBee returned empty or too-short content.")
-        blocked = "performing security verification" in html.lower() or (
-            "request blocked" in html.lower()
-            and "abuse from this hosting" in html.lower()
-        )
-        if blocked:
-            raise FAQDownloadError(
-                "ScrapingBee could not bypass Cloudflare for this URL."
-            )
-        logger.info("ScrapingBee fetch succeeded (%d bytes)", len(html))
-        return FetchResult(content=html, is_html=True)
+        return FetchResult(content=markdown)
 
 
 def main() -> None:
@@ -467,10 +400,6 @@ def main() -> None:
         help="Output directory (default: guides/)",
     )
     parser.add_argument(
-        "-s", "--scrapingbee", default=None, metavar="KEY",
-        help="ScrapingBee API key to bypass Cloudflare via residential IPs",
-    )
-    parser.add_argument(
         "--firecrawl", default=None, metavar="KEY",
         help="Firecrawl API key to bypass Cloudflare (primary method)",
     )
@@ -481,7 +410,6 @@ def main() -> None:
     args = parser.parse_args()
     try:
         downloader = FAQDownloader(args.url, args.output,
-                                   scrapingbee_key=args.scrapingbee,
                                    firecrawl_key=args.firecrawl)
         filepath = downloader.fetch_and_save(commit_title_path=args.commit_title)
         print(filepath)
