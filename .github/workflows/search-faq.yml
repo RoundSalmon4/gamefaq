@@ -65,6 +65,9 @@ jobs:
       - name: Write job summary
         run: cat summary.md >> $GITHUB_STEP_SUMMARY
 
+      - name: Show summary in log
+        run: cat summary.md
+
       - name: Clean up
         if: always()
         run: rm -f summary.md
