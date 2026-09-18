@@ -72,8 +72,78 @@ _JUNK_PATTERNS: list[re.Pattern[str]] = [
         r"^\s*Just a moment\s*$",
         r"Performing security verification",
         r"security service to protect against",
+        # Site navigation/UI chrome that leaks into scraped markdown
+        r"^\s*\*?[Bb]ookmark\*?\s*$",
+        r"^\s*Jump to:\s*$",
+        r"^\s*Message Sent\s*$",
+        r"Would you recommend this Guide\?",
+        r"SendSkipHide",
+        r"Close X",
+        r"What do you need help on",
+        r"^\[\s*Log In\]",
+        r"^\[\s*Sign Up\]",
+        r"^\s*[-*]?\s*\[Next[^\]]*\]\(https://gamefaqs\.gamespot\.com/",
+        r"^\s*[-*]?\s*\[Previous[^\]]*\]\(https://gamefaqs\.gamespot\.com/",
+        r"^\s*[-*]?\s*Next:",
+        r"^\s*[-*]?\s*Previous:",
+        r"^Menu\s*$",
+        r"^Back Button\s*$",
+        r"^ApplyCancel\s*$",
+        r"^Reject AllConfirm My Choices\s*$",
+        r"^ConsentLeg\.Interest\s*$",
+        r"^checkbox labellabel",
+        r"^Search Icon\s*$",
+        r"^Filter Icon\s*$",
+        r"^Clear\s*$",
+        r"Powered by Onetrust",
+        r"cdn\.cookielaw\.org",
+        r"!\[Company Logo\]",
+        r"^\|\s*\|$",
+        r"^\|\s*---?\s*\|$",
+        r"!\[\]\(https://gamefaqs\.gamespot\.com/ffaq/",
     )
 ]
+
+
+def _clean_content(text: str) -> str:
+    lines = text.split("\n")
+
+    # Drop everything before the guide's own title heading.
+    for i, line in enumerate(lines):
+        if re.match(r"^#{1,6}\s+\S", line):
+            lines = lines[i:]
+            break
+
+    # Cut the footer at the site's cookie/preference widgets.
+    for i, line in enumerate(lines):
+        if re.match(
+            r"^#{1,4}\s*(Privacy Preference Center|Manage Consent|Cookie List)\s*$",
+            line,
+            re.IGNORECASE,
+        ):
+            lines = lines[:i]
+            break
+
+    cleaned: list[str] = []
+    prev_was_junk = False
+    blank_streak = 0
+    for line in lines:
+        line = line.rstrip()
+        if any(pat.search(line) for pat in _JUNK_PATTERNS):
+            prev_was_junk = True
+            blank_streak = 0
+            continue
+        if not line.strip():
+            blank_streak += 1
+            if prev_was_junk or blank_streak > 1:
+                continue
+            cleaned.append("")
+            continue
+        prev_was_junk = False
+        blank_streak = 0
+        cleaned.append(line)
+
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned)).strip()
 
 
 class FetchResult(NamedTuple):
@@ -101,32 +171,14 @@ def _validate_url(url: str) -> bool:
 
 
 def _generate_filename(url: str) -> str:
+    """Name the output file after the game slug, e.g. final-fantasy-vii-remake-intergrade.md"""
     try:
-        parts = urlparse(url).path.strip("/").split("/")
-        if len(parts) >= 4:
-            console = parts[0]
-            game = parts[1]
-            faq_id = parts[-1]
-            return f"{console}-{game}-faq-{faq_id}.md"
-        elif len(parts) >= 2:
-            return f"{parts[1]}.md"
+        m = re.search(r"gamefaqs\.gamespot\.com/[a-z0-9-]+/(\d+-[^/?]+)", url)
+        if m:
+            return f"{re.sub(r'^\d+-', '', m.group(1))}.md"
     except Exception:
         pass
     return "gamefaqs_download.md"
-
-
-def _clean_content(text: str) -> str:
-    cleaned: list[str] = []
-    prev_was_junk = False
-    for line in text.split("\n"):
-        if any(pat.search(line) for pat in _JUNK_PATTERNS):
-            prev_was_junk = True
-            continue
-        if prev_was_junk and not line.strip():
-            continue
-        prev_was_junk = False
-        cleaned.append(line)
-    return "\n".join(cleaned).rstrip()
 
 
 def _scrapingbee_html(url: str, key: str) -> str:
