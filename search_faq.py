@@ -330,7 +330,7 @@ def _extract_faq_links(inner: dict, base_url: str) -> list[FAQGuide]:
         window = (markdown[max(0, pos - 350):pos] + " " + markdown[pos:pos + 250]).lower()
         best: tuple[int, str] = (5, "Unrated")
         best_idx = len(window)
-        for rank, word in sorted(RATING_ORDER.items(), key=lambda kv: kv[1]):
+        for word, rank in sorted(RATING_ORDER.items(), key=lambda kv: kv[1]):
             idx = window.find(word.lower())
             if idx != -1 and idx < best_idx:
                 best = (rank, word)
