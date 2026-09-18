@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 debug_*.html
 debug_*.json
+commit_title.txt
 debug-artifact/
 debug-artifact.zip
 logs/

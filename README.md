@@ -2,7 +2,7 @@
 
 Search and download GameFAQs guides as markdown.
 
-GameFAQs blocks VPN users and has Cloudflare protections, so this project uses Firecrawl and ScrapingBee to bypass those restrictions in CI. Search uses Brave Search via Playwright to avoid direct access blocks.
+GameFAQs blocks VPN users and has Cloudflare protections, so this project uses Firecrawl and ScrapingBee to bypass those restrictions in CI. Both search and downloads go through Firecrawl's hosted infrastructure, which works from any network without being IP-blocked.
 
 ## Workflow
 
@@ -33,13 +33,13 @@ Requires `FIRECRAWL_API_KEY` and `SCRAPINGBEE_API_KEY` repository secrets.
 
 ```bash
 pip install -r requirements.txt
-python -m playwright install chromium
 
-# Search for a game
+# Search for a game (requires a Firecrawl API key)
+export FIRECRAWL_API_KEY="your-key"
 python search_faq.py "chrono trigger"
+python search_faq.py "monster hunter rise" -c switch
 
 # Download a guide (requires API keys)
-export FIRECRAWL_API_KEY="your-key"
 python download_faq.py https://gamefaqs.gamespot.com/ps1/57080-chrono-trigger
 python download_faq.py https://gamefaqs.gamespot.com/ps1/57080-chrono-trigger/faqs/46950
 ```
@@ -49,11 +49,14 @@ python download_faq.py https://gamefaqs.gamespot.com/ps1/57080-chrono-trigger/fa
 - `--firecrawl KEY` — Firecrawl API key (primary method)
 - `-s` / `--scrapingbee KEY` — ScrapingBee API key (fallback)
 - `-o` / `--output DIR` — output directory (default: `guides/`)
+- `--commit-title FILE` — write a commit title (e.g. `Add <game> guide`) to FILE
 
-## Search Filters
+## Search CLI options
 
-- `--console` / `-c` — filter by platform (snes, ps1, gba, ds, etc.)
+- `--firecrawl KEY` — Firecrawl API key (required for search)
+- `-c` / `--console PLATFORM` — filter by platform (snes, ps1, gba, ds, etc.)
 - `-g N` — show FAQ guides for search result #N
 - `-a` / `--all-guides` — fetch FAQ listings for all results
+- `--min-relevance FLOAT` — minimum relevance threshold (default 0.3)
 - `--markdown` — output as markdown (for CI job summaries)
 - `-l` — list results only
