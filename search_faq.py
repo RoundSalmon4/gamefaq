@@ -260,7 +260,11 @@ def search_games(query: str, console_filter: str | None = None,
                 continue
 
             def _faq_title(h: str) -> str:
-                return _slug_title(re.sub(r".*/faqs/\d+-", "", h))
+                m = re.search(r"/faqs/\d+/([a-z0-9-]+)", h)
+                if m:
+                    return m.group(1).replace("-", " ").title()
+                m2 = re.search(r"/faqs/\d+-([^/?]+)", h)
+                return _slug_title(m2.group(1)) if m2 else "FAQ"
 
             if _is_gamefaqs_faq_page(href):
                 if game_base not in seen_bases:
