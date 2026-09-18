@@ -359,6 +359,12 @@ def _extract_faq_links(inner: dict, base_url: str) -> list[FAQGuide]:
         guides.append(FAQGuide(title=title, url=url, rating=rating, rating_rank=rank))
 
     guides.sort(key=lambda g: g.rating_rank)
+    logger.info(
+        "Extracted %d FAQ guide(s) from listing (%d via markdown, %d from links array)",
+        len(guides),
+        len(seen_md),
+        len(faq_urls),
+    )
     return guides
 
 
@@ -394,11 +400,23 @@ def get_faqs(game_url: str, game_title: str = "",
     guides = _extract_faq_links(inner, faq_listing_url)
     guides.sort(key=lambda g: g.rating_rank)
 
+    if debug:
+        dump_payload = {
+            "url": faq_listing_url,
+            "faq_urls_in_links": [
+                u for u in (inner.get("links") or [])
+                if re.search(r"/faqs/\d+", u)
+            ],
+            "parsed_guides": [
+                {"title": g.title, "url": g.url, "rating": g.rating}
+                for g in guides
+            ],
+            "markdown": inner.get("markdown", ""),
+        }
+        _dump_debug_json(dump_payload, f"debug_faqs_{debug_index}.json")
+
     if guides:
         return guides
-
-    if debug:
-        _dump_debug_json(inner, f"debug_faqs_{debug_index}.json")
 
     # Listing came back without FAQ links - fall back to a search for this game.
     logger.info("No FAQ links in listing scrape, searching for FAQ pages...")
