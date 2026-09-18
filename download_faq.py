@@ -201,7 +201,9 @@ def _resolve_game_url(url: str, firecrawl_key: str | None = None,
             f"Try providing a direct FAQ URL instead."
         )
 
-    best = min(guides, key=lambda g: (g.rating_rank, g.title))
+    # Page order is GameFAQs' rating order (highest rated first).
+    # Skip guides flagged incomplete when a completed guide exists.
+    best = next((g for g in guides if "Incomplete" not in g.notes), guides[0])
     logger.info("Auto-selected FAQ: %s (%s)", best.url, best.title)
     return best.url
 
