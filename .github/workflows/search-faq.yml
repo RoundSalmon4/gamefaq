@@ -52,14 +52,14 @@ jobs:
             GUIDES_FLAG="--all-guides"
           fi
 
-          python search_faq.py "${{ inputs.query }}" $CONSOLE_FLAG $GUIDES_FLAG --markdown --debug --min-relevance ${{ inputs.min_relevance }} > summary.md || true
+          python search_faq.py "${{ inputs.query }}" $CONSOLE_FLAG $GUIDES_FLAG --markdown --debug --min-relevance ${{ inputs.min_relevance }} --firecrawl "${{ secrets.FIRECRAWL_API_KEY }}" > summary.md || true
 
-      - name: Upload debug HTML
+      - name: Upload debug data
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-html
-          path: debug_page.html
+          path: debug_page.json
           if-no-files-found: ignore
 
       - name: Write job summary
