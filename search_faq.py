@@ -51,8 +51,6 @@ RATING_ORDER = {
     "Unrated": 5,
 }
 
-RATING_WORDS = ["highest rated", "most recommended", "complete", "partial"]
-
 _last_request_ts = 0.0
 
 
@@ -160,11 +158,21 @@ def _firecrawl_scrape(url: str, api_key: str) -> dict:
 
 
 def _parse_gamefaqs_url(href: str) -> tuple[str, str]:
-    """Extract (platform, slug) from a GameFAQs URL. Returns ('', '') on failure."""
+    """Extract (platform_slug, full_slug) from a GameFAQs URL.
+    Returns ('', '') on failure."""
     m = re.search(r"gamefaqs\.gamespot\.com/([a-z0-9-]+)/(\d+-[^/?]+)", href)
     if m:
-        return m.group(1).replace("-", " ").title(), m.group(2)
+        return m.group(1), m.group(2)
     return "", ""
+
+
+def _canonical_game_url(href: str) -> str | None:
+    """Normalize any GameFAQs URL down to the game page base URL:
+    https://gamefaqs.gamespot.com/<platform>/<gameid>-<slug>"""
+    platform, slug = _parse_gamefaqs_url(href)
+    if not slug:
+        return None
+    return f"https://gamefaqs.gamespot.com/{platform}/{slug}"
 
 
 def _is_gamefaqs_faq_page(href: str) -> bool:
@@ -233,9 +241,11 @@ def search_games(query: str, console_filter: str | None = None,
             if any(skip in href for skip in ("/boards/", "/search", "/topic/", "/community/")):
                 continue
 
-            platform, slug = _parse_gamefaqs_url(href)
+            platform_slug, slug = _parse_gamefaqs_url(href)
             if not slug:
                 continue
+            platform = platform_slug.replace("-", " ").title()
+            game_base = _canonical_game_url(href) or f"https://gamefaqs.gamespot.com/{platform_slug}/{slug}"
 
             slug_title = _slug_title(slug)
             title_words = set(slug_title.lower().split())
@@ -244,8 +254,6 @@ def search_games(query: str, console_filter: str | None = None,
 
             if console_filter and console_filter.upper() not in platform.upper():
                 continue
-
-            game_base = re.sub(r"/faqs/.*$", "", href).rstrip("/")
 
             def _faq_title(h: str) -> str:
                 return _slug_title(re.sub(r".*/faqs/\d+-", "", h))
@@ -280,74 +288,144 @@ def search_games(query: str, console_filter: str | None = None,
 
 
 def _extract_faq_links(inner: dict, base_url: str) -> list[FAQGuide]:
-    """Extract FAQ guides from scraped game page data."""
-    links: set[str] = set()
-    for href in inner.get("links") or []:
-        if re.search(r"/faqs/\d+", href):
-            if "gamefaqs.gamespot.com" not in href:
-                href = urljoin(base_url, href)
-            links.add(href)
+    """Extract FAQ guides from scraped game page data.
 
+    Prefers the real guide title from the page markdown (the link text),
+    falling back to the URL slug when the page only exposes links.
+    """
     markdown = inner.get("markdown") or ""
-    for m in re.finditer(r"\]\((https?://gamefaqs\.gamespot\.com[^)]*?/faqs/\d+[^)]*)\)", markdown):
-        links.add(m.group(1))
+    raw_links = inner.get("links") or []
+
+    faq_urls: list[tuple[str, str]] = []  # (absolute_url, title_from_markdown or "")
+
+    # Titles come from markdown links: [Title](url)
+    seen_md: set[str] = set()
+    for m in re.finditer(
+        r"\[([^\]]{1,150})\]\(((?:https?://gamefaqs\.gamespot\.com|/)[^)\s]*?/faqs/\d+[^)\s]*)\)",
+        markdown,
+    ):
+        title = m.group(1).strip()
+        url = m.group(2)
+        if not re.search(r"/faqs/\d+", url):
+            continue
+        if "gamefaqs.gamespot.com" not in url:
+            url = urljoin(base_url, url)
+        if url in seen_md:
+            continue
+        seen_md.add(url)
+        faq_urls.append((url, title))
+
+    # Any /faqs/ links from the links array not already covered
+    for href in raw_links:
+        if not re.search(r"/faqs/\d+", href):
+            continue
+        if "gamefaqs.gamespot.com" not in href:
+            href = urljoin(base_url, href)
+        if href in seen_md:
+            continue
+        seen_md.add(href)
+        faq_urls.append((href, ""))
+
+    def _rating_for(markdown: str, pos: int) -> tuple[int, str]:
+        window = (markdown[max(0, pos - 350):pos] + " " + markdown[pos:pos + 250]).lower()
+        best: tuple[int, str] = (5, "Unrated")
+        best_idx = len(window)
+        for rank, word in sorted(RATING_ORDER.items(), key=lambda kv: kv[1]):
+            idx = window.find(word.lower())
+            if idx != -1 and idx < best_idx:
+                best = (rank, word)
+                best_idx = idx
+        return best
 
     guides: list[FAQGuide] = []
-    seen: set[str] = set()
+    added: set[str] = set()
 
-    def _rating_for(idx: int) -> str:
-        before = markdown[max(0, idx - 400):idx].lower()
-        for word in RATING_WORDS:
-            if word in before:
-                return RATING_ORDER[word.title()], word.title()
-        return 5, "Unrated"
-
-    for href in sorted(links):
-        if href in seen:
+    for url, md_title in faq_urls:
+        if url in added:
             continue
-        seen.add(href)
+        added.add(url)
 
-        slug_m = re.search(r"/faqs/\d+-([^/?]+)", href)
-        title = _slug_title(slug_m.group(1)) if slug_m else "FAQ"
+        title = md_title or _slug_title(
+            re.search(r"/faqs/\d+-([^/]+)", url).group(1) if re.search(r"/faqs/\d+-[^/]+", url) else ""
+        )
 
-        idx = markdown.find(href)
-        rank, rating = _rating_for(idx) if idx >= 0 else (5, "Unrated")
+        idx = markdown.find(url)
+        if idx == -1:
+            # relative link form may not be in markdown text directly
+            rel = url[len(base_url.rstrip("/")):] if url.startswith(base_url) else None
+            idx = markdown.find(rel) if rel else -1
+        rank, rating = _rating_for(markdown, idx) if idx >= 0 else (5, "Unrated")
 
-        guides.append(FAQGuide(title=title, url=href, rating=rating, rating_rank=rank))
+        guides.append(FAQGuide(title=title, url=url, rating=rating, rating_rank=rank))
 
+    guides.sort(key=lambda g: g.rating_rank)
     return guides
 
 
 def get_faqs(game_url: str, game_title: str = "",
              platform: str = "", debug: bool = False,
              pre_discovered: list[FAQGuide] | None = None,
-             api_key: str | None = None) -> list[FAQGuide]:
-    """Fetch the FAQ listing for a game via Firecrawl scrape."""
+             api_key: str | None = None,
+             debug_index: int = 0) -> list[FAQGuide]:
+    """Fetch the FAQ listing for a game via Firecrawl."""
     if pre_discovered:
         logger.info("Using %d pre-discovered FAQ URLs from search", len(pre_discovered))
         return pre_discovered
     if not api_key:
         return []
 
-    base_url = re.sub(r"/faqs/.*$", "", game_url).rstrip("/")
+    base_url = _canonical_game_url(game_url)
+    if not base_url:
+        logger.error("Could not normalize game URL: %s", game_url)
+        return []
 
-    faq_listing_url = base_url if base_url.endswith("/faqs") else base_url + "/faqs"
+    faq_listing_url = base_url + "/faqs"
 
+    inner: dict = {}
     try:
         inner = _firecrawl_scrape(faq_listing_url, api_key)
     except (RuntimeError, http_requests.RequestException) as exc:
         logger.error("Failed to scrape FAQ listing: %s", exc)
         if debug:
-            _dump_debug_json({"url": faq_listing_url, "error": str(exc)})
+            _dump_debug_json({"url": faq_listing_url, "error": str(exc)},
+                             f"debug_faqs_{debug_index}.json")
         return []
 
     guides = _extract_faq_links(inner, faq_listing_url)
     guides.sort(key=lambda g: g.rating_rank)
 
-    if not guides and debug:
-        _dump_debug_json(inner)
+    if guides:
+        return guides
 
-    return guides
+    if debug:
+        _dump_debug_json(inner, f"debug_faqs_{debug_index}.json")
+
+    # Listing came back without FAQ links - fall back to a search for this game.
+    logger.info("No FAQ links in listing scrape, searching for FAQ pages...")
+    slug = re.search(r"/\d+-([^/]+)$", base_url)
+    search_term = slug.group(1).replace("-", " ").title() if slug else game_title
+    q = f'{search_term} site:gamefaqs.gamespot.com/faqs'
+    try:
+        results = _firecrawl_search(q, api_key, limit=10)
+    except (RuntimeError, http_requests.RequestException) as exc:
+        logger.error("Fallback FAQ search failed: %s", exc)
+        return []
+
+    platform_slug, game_slug = _parse_gamefaqs_url(base_url)
+    faq_results: list[FAQGuide] = []
+    for item in results:
+        url = item.get("url", "")
+        if not re.search(r"/faqs/\d+", url):
+            continue
+        if platform_slug and game_slug and f"{platform_slug}/{game_slug}" not in url:
+            continue
+        if "gamefaqs.gamespot.com" not in url:
+            continue
+        title = _slug_title(re.sub(r".*/faqs/\d+-", "", url))
+        faq_results.append(FAQGuide(title=title, url=url))
+
+    logger.info("Fallback search found %d FAQ page(s)", len(faq_results))
+    return faq_results
 
 
 def format_markdown(query: str, console_filter: str | None,
@@ -476,6 +554,7 @@ def main() -> None:
             game.url, game.title, game.platform, args.debug,
             pre_discovered=game.guides or None,
             api_key=api_key,
+            debug_index=args.guides,
         )
 
     if args.all_guides:
@@ -485,6 +564,7 @@ def main() -> None:
                 game.url, game.title, game.platform, args.debug,
                 pre_discovered=game.guides or None,
                 api_key=api_key,
+                debug_index=i,
             )
 
     if args.markdown:

@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 debug_*.html
+debug_*.json
 debug-artifact/
 debug-artifact.zip
 logs/

@@ -59,7 +59,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: debug-html
-          path: debug_page.json
+          path: debug_*.json
           if-no-files-found: ignore
 
       - name: Write job summary
