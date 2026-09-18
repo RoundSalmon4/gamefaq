@@ -146,6 +146,57 @@ def _clean_content(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned)).strip()
 
 
+def _rewrite_chapter_links(markdown: str) -> str:
+    """Rewrite GameFAQs chapter links to local anchors so the downloaded
+    guide navigates within itself instead of back to the site.
+
+    Matches the link text to a heading in the same file and links to the
+    GitHub-style anchor for that heading (same slug rules the site uses).
+    """
+    heading_entries: list[tuple[str, str]] = []  # (anchor, raw_heading_text)
+    counts: dict[str, int] = {}
+    for m in re.finditer(r"^#{1,6}\s+(.+?)\s*$", markdown, re.M):
+        raw = m.group(1).strip()
+        base = re.sub(r"[^\w\s-]", "", raw.lower()).replace(" ", "-")
+        n = counts.get(base, 0)
+        counts[base] = n + 1
+        heading_entries.append((base if n == 0 else f"{base}-{n}", raw))
+
+    def _norm(text: str) -> str:
+        text = re.sub(r"^(?:Next|Previous):\s*", "", text).strip()
+        text = re.sub(r"[*_`]", "", text)
+        text = re.sub(r"['\u2019]", "", text)
+        text = re.sub(r"[^\w\s-]", " ", text)
+        text = re.sub(r"[-]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text.lower()
+
+    by_text: dict[str, str] = {}
+    for anchor, raw in heading_entries:
+        by_text.setdefault(_norm(raw), anchor)
+
+    def _repl(m: re.Match) -> str:
+        text, url = m.group(1), m.group(2)
+        if not re.search(r"gamefaqs\.gamespot\.com/.+/faqs/\d+/", url):
+            return m.group(0)
+        ntext = _norm(text)
+        if ntext in by_text:
+            return f"[{text}](#{by_text[ntext]})"
+        slug_m = re.search(r"/faqs/\d+/([a-z0-9-]+)", url)
+        if slug_m:
+            target = _norm(slug_m.group(1).replace("-", " "))
+            for anchor, raw in heading_entries:
+                if _norm(raw) == target:
+                    return f"[{text}](#{anchor})"
+        return m.group(0)
+
+    return re.sub(
+        r"\[([^\]]{1,150})\]\(([^)\s]*?gamefaqs\.gamespot\.com[^)\s]*?/faqs/\d+/[^)\s]*)\)",
+        _repl,
+        markdown,
+    )
+
+
 class FetchResult(NamedTuple):
     content: str
     is_html: bool
@@ -290,6 +341,7 @@ class FAQDownloader:
         else:
             text = result.content
         text = _clean_content(text)
+        text = _rewrite_chapter_links(text)
         filename = _generate_filename(self.url)
         filepath = os.path.join(self.output_dir, filename)
         os.makedirs(self.output_dir, exist_ok=True)
