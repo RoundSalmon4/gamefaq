@@ -69,10 +69,12 @@ class FAQGuide:
     url: str
     rating: str = "Unrated"
     rating_rank: int = 5
+    author: str = ""
 
     def __str__(self) -> str:
         tag = f" [{self.rating}]" if self.rating != "Unrated" else ""
-        return f"  {self.title}{tag}\n    {self.url}"
+        by = f" by {self.author}" if self.author else ""
+        return f"  {self.title}{by}{tag}\n    {self.url}"
 
 
 @dataclass
@@ -340,6 +342,37 @@ def _extract_faq_links(inner: dict, base_url: str) -> list[FAQGuide]:
     guides: list[FAQGuide] = []
     added: set[str] = set()
 
+    def _section_heading(pos: int) -> str:
+        if pos < 0:
+            return ""
+        heading = ""
+        for line in reversed(markdown[:pos].splitlines()):
+            line = line.strip()
+            if re.match(r"^#{1,6}\s+\S", line):
+                heading = re.sub(r"^#+\s*", "", line).strip()
+                break
+        return heading
+
+    def _rating_from_heading(heading: str) -> tuple[int, str] | None:
+        h = heading.lower()
+        if "full game guide" in h:
+            return 1, "Full Game Guide"
+        if "in-depth" in h:
+            return 2, "In-Depth Guide"
+        if "highest rated" in h:
+            return 1, "Highest Rated"
+        if "most recommended" in h:
+            return 2, "Most Recommended"
+        if "complete" in h:
+            return 3, "Complete"
+        if "partial" in h:
+            return 4, "Partial"
+        return None
+
+    def _author_after(end: int) -> str:
+        m = re.search(r"\bby\s+\[([^\]]+)\]", markdown[end:end + 120])
+        return m.group(1).strip() if m else ""
+
     for url, md_title in faq_urls:
         if url in added:
             continue
@@ -351,14 +384,20 @@ def _extract_faq_links(inner: dict, base_url: str) -> list[FAQGuide]:
 
         idx = markdown.find(url)
         if idx == -1:
-            # relative link form may not be in markdown text directly
             rel = url[len(base_url.rstrip("/")):] if url.startswith(base_url) else None
             idx = markdown.find(rel) if rel else -1
-        rank, rating = _rating_for(markdown, idx) if idx >= 0 else (5, "Unrated")
 
-        guides.append(FAQGuide(title=title, url=url, rating=rating, rating_rank=rank))
+        author = _author_after(idx + len(url)) if idx >= 0 else ""
 
-    guides.sort(key=lambda g: g.rating_rank)
+        heading = _section_heading(idx) if idx >= 0 else ""
+        rating_info = _rating_from_heading(heading)
+        rank, rating = rating_info if rating_info else _rating_for(markdown, idx)
+
+        guides.append(FAQGuide(
+            title=title, url=url, rating=rating, rating_rank=rank, author=author,
+        ))
+
+    guides.sort(key=lambda g: (g.rating_rank, g.title))
     logger.info(
         "Extracted %d FAQ guide(s) from listing (%d via markdown, %d from links array)",
         len(guides),
@@ -468,11 +507,11 @@ def format_markdown(query: str, console_filter: str | None,
         if guides_map and i in guides_map:
             guides = guides_map[i]
             if guides:
-                lines.append("| # | Guide | Rating | URL |")
-                lines.append("|---|-------|--------|-----|")
+                lines.append("| # | Guide | Type | Author | URL |")
+                lines.append("|---|-------|------|--------|-----|")
                 for j, g in enumerate(guides, 1):
                     lines.append(
-                        f"| {j} | {g.title} | {g.rating} | [link]({g.url}) |"
+                        f"| {j} | {g.title} | {g.rating} | {g.author} | [link]({g.url}) |"
                     )
                 lines.append("")
             else:
