@@ -145,6 +145,40 @@ def _clean_content(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned)).strip()
 
 
+def _dedupe_repeated_chapter_blocks(text: str) -> str:
+    """GameFAQs single-page output repeats chapters that have subsections:
+    the full chapter content appears first, then the parent heading is
+    restated above each subsection. Drop those repeated passes."""
+    lines = text.split("\n")
+    seen: set[str] = set()
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+
+    def _key(chapter: str) -> str:
+        return re.sub(r"[^\w\s-]", "", chapter.lower()).replace(" ", "-")
+
+    while i < n:
+        line = lines[i]
+        m = re.match(r"^(#{1,2})\s+(.+?)\s*$", line)
+        if m:
+            key = _key(m.group(2).strip())
+            if key in seen:
+                # Skip the entire repeated chapter block until a new chapter.
+                i += 1
+                while i < n:
+                    m2 = re.match(r"^(#{1,2})\s+(.+?)\s*$", lines[i])
+                    if m2 and _key(m2.group(2).strip()) not in seen:
+                        break
+                    i += 1
+                continue
+            seen.add(key)
+        out.append(line)
+        i += 1
+
+    return "\n".join(out)
+
+
 def _rewrite_chapter_links(markdown: str) -> str:
     """Rewrite GameFAQs chapter links to local anchors so the downloaded
     guide navigates within itself instead of back to the site.
@@ -298,6 +332,7 @@ class FAQDownloader:
     def fetch_and_save(self, commit_title_path: str | None = None) -> str:
         result = self._fetch_with_retries()
         text = _clean_content(result.content)
+        text = _dedupe_repeated_chapter_blocks(text)
         text = _rewrite_chapter_links(text)
         filename = _generate_filename(self.url)
         filepath = os.path.join(self.output_dir, filename)
